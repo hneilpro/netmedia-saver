@@ -38,7 +38,13 @@
   <div class="row size-row">
     <label>Max <input type="number" id="imgMaxW" min="0" step="50" placeholder="No limit"> × <input type="number" id="imgMaxH" min="0" step="50" placeholder="No limit"> px</label>
   </div>
-  <div class="hint dim">Images smaller than the minimum (or larger than the maximum, when set) are skipped. Needs one tiny extra request per image to read its header; images whose size can't be read are saved anyway.</div>
+  <div class="row"><label><span class="dim">Combine with file size&nbsp;</span>
+    <select id="imgDimsLogic">
+      <option value="and">File size AND dimensions</option>
+      <option value="or">File size OR dimensions</option>
+    </select></label>
+  </div>
+  <div class="hint dim">AND (default): an image must pass both the file-size gate and the dimension gate. OR: an image is saved when either gate passes — e.g. a big-dimension image under the min file size is still saved. Needs one tiny extra request per image to read its header; images whose size can't be read are saved anyway.</div>
 </section>
 
 <section>

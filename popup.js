@@ -84,6 +84,9 @@ async function refresh() {
   if (document.activeElement !== $('imgMinH')) $('imgMinH').value = imgD.minH || 0;
   if (document.activeElement !== $('imgMaxW')) $('imgMaxW').value = imgD.maxW > 0 ? imgD.maxW : '';
   if (document.activeElement !== $('imgMaxH')) $('imgMaxH').value = imgD.maxH > 0 ? imgD.maxH : '';
+  const imgLogic = $('imgDimsLogic');
+  imgLogic.value = imgD.logic === 'or' ? 'or' : 'and';
+  imgLogic.disabled = !(imgD.enabled !== false);
   $('tImage').checked = settings.types.image;
   $('tVideo').checked = settings.types.video;
   $('tAudio').checked = settings.types.audio;
@@ -254,6 +257,7 @@ document.addEventListener('DOMContentLoaded', () => {
     return isMax ? (v > 0 ? v : '') : v;
   };
   $('imgDimsEnabled').addEventListener('change', (e) => pushDims({ enabled: e.target.checked }).then(refresh));
+  $('imgDimsLogic').addEventListener('change', (e) => pushDims({ logic: e.target.value }).then(refresh));
   for (const [id, key, isMax] of [['imgMinW', 'minW', false], ['imgMinH', 'minH', false], ['imgMaxW', 'maxW', true], ['imgMaxH', 'maxH', true]]) {
     $(id).addEventListener('change', (e) => {
       const raw = String(e.target.value).trim();

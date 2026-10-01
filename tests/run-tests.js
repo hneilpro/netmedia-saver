@@ -1,9 +1,11 @@
 /* NetMedia Saver unit tests — runs background.js (the real service worker
- * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.5
- * behavior: stream-segment skip, image dimension gates (probe + parsers),
- * plus the earlier v1.1–v1.4 behavior (typed min / optional max gates,
- * origin-tab capture default, basename dedup default, cacheFiles/scanExisting
- * handlers, dev-mode cache inspector).
+ * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.6
+ * behavior: atomic in-flight dedup claims, interrupted-download cleanup and
+ * dedup rollback, AND/OR image filter logic, plus the v1.5 behavior
+ * (stream-segment skip, image dimension gates) and the earlier v1.1–v1.4
+ * behavior (typed min / optional max gates, origin-tab capture default,
+ * basename dedup default, cacheFiles/scanExisting handlers, dev-mode cache
+ * inspector).
  * Run: node tests/run-tests.js  (exit 0 = all pass)
  */
 'use strict';
@@ -14,6 +16,8 @@ const vm = require('vm');
 /* ---------- chrome mock ---------- */
 const store = {};            // chrome.storage.local backing
 const downloadCalls = [];    // chrome.downloads.download invocations
+const eraseCalls = [];       // chrome.downloads.erase invocations
+let nextDlId = 101;
 let downloadSearchResults = [];
 const listeners = {};
 
@@ -39,7 +43,9 @@ const chrome = {
   downloads: {
     onChanged: { addListener: (fn) => { listeners.dlChanged = fn; } },
     search: (q, cb) => cb(downloadSearchResults),
-    download: (opts, cb) => { downloadCalls.push(opts); cb(101); },
+    download: (opts, cb) => { downloadCalls.push(opts); cb(nextDlId++); },
+    erase: (q, cb) => { eraseCalls.push(q); cb(); },
+    removeFile: (id, cb) => { cb(); },
   },
   tabs: {
     onRemoved: { addListener: (fn) => { listeners.tabRemoved = fn; } },
@@ -331,6 +337,118 @@ async function main() {
   await tick();
   ok(downloadCalls.length === db + 2, 'image with a failed probe still downloads (fail open)');
   sandbox.fetch = undefined;
+
+  // 15. v1.6: atomic in-flight dedup — same URL fired twice concurrently downloads once
+  await msg({ cmd: 'setSettings', settings: { enabled: true, minSizeKB: 0, maxSizeKB: 0, imgDims: { enabled: false } }, tabId: 9 });
+  downloadCalls.length = 0;
+  const race1 = nms.onHeadersReceived(details({ url: 'https://img.test/race.jpg', size: 90000, tabId: 9 }));
+  const race2 = nms.onHeadersReceived(details({ url: 'https://img.test/race.jpg', size: 90000, tabId: 9 }));
+  await Promise.all([race1, race2]);
+  await tick();
+  ok(downloadCalls.length === 1, 'same URL fired twice concurrently downloads exactly once');
+  ok(nms.getInflightPaths().size === 0, 'in-flight claim released after the task finishes');
+
+  // 16. v1.6: same basename under different signed URLs, same size, concurrent -> one download
+  downloadCalls.length = 0;
+  const dup1 = nms.onHeadersReceived(details({ url: 'https://a.test/iflight.jpg?stp=aaa', size: 90000, tabId: 9 }));
+  const dup2 = nms.onHeadersReceived(details({ url: 'https://b.test/iflight.jpg?stp=bbb', size: 90000, tabId: 9 }));
+  await Promise.all([dup1, dup2]);
+  await tick();
+  ok(downloadCalls.length === 1, 'same basename + same size from different URLs downloads once (no (1) rename)');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.detail === 'already being saved'),
+    'in-flight duplicate logged as skipped-duplicate');
+
+  // 17. v1.6: same basename but genuinely different sizes -> both saved (Chrome uniquifies)
+  downloadCalls.length = 0;
+  const sz1 = nms.onHeadersReceived(details({ url: 'https://a.test/sizediff.jpg?v=1', size: 90000, tabId: 9 }));
+  const sz2 = nms.onHeadersReceived(details({ url: 'https://b.test/sizediff.jpg?v=2', size: 500000, tabId: 9 }));
+  await Promise.all([sz1, sz2]);
+  await tick();
+  ok(downloadCalls.length === 2, 'same basename with different sizes saves both (uniquify fallback kept)');
+
+  // 18. v1.6: sizeGate unit tests
+  const sg = nms.sizeGate;
+  await msg({ cmd: 'setSettings', settings: { minSizeKB: 75, maxSizeKB: 1024, saveUnknownSize: true } });
+  ok(sg(100 * 1024) === 'pass', 'sizeGate passes within range');
+  ok(sg(10 * 1024) === 'fail-size', 'sizeGate fails below min');
+  ok(sg(2 * 1024 * 1024) === 'fail-too-large', 'sizeGate fails above max');
+  ok(sg(null) === 'pass', 'sizeGate passes unknown size when saveUnknownSize is on');
+  await msg({ cmd: 'setSettings', settings: { saveUnknownSize: false } });
+  ok(sg(null) === 'fail-unknown', 'sizeGate fails unknown size when saveUnknownSize is off');
+  ok(nms.sizeSkipStatus('fail-size') === 'skipped-size', 'sizeSkipStatus maps fail-size');
+  ok(nms.sizeSkipStatus('fail-too-large') === 'skipped-too-large', 'sizeSkipStatus maps fail-too-large');
+  ok(nms.sizeSkipStatus('fail-unknown') === 'skipped-unknown', 'sizeSkipStatus maps fail-unknown');
+
+  // 19. v1.6: AND/OR filter logic end-to-end
+  await msg({ cmd: 'setSettings', settings: {
+    enabled: true, minSizeKB: 200, maxSizeKB: 0, saveUnknownSize: false,
+    imgDims: { enabled: true, minW: 600, minH: 600, maxW: 0, maxH: 0, logic: 'or' },
+  }, tabId: 9 });
+  sandbox.fetch = rangeFetch(png800); // 800x600
+  const orBase = downloadCalls.length;
+  await nms.onHeadersReceived(details({ url: 'https://img.test/or-big-dims.png', size: 100 * 1024, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === orBase + 1, 'OR: small file with big dimensions is saved');
+  await nms.onHeadersReceived(details({ url: 'https://img.test/or-big-size.png', size: 300 * 1024, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === orBase + 2, 'OR: file passing the size gate is saved');
+  sandbox.fetch = rangeFetch(png100); // 100x100
+  await nms.onHeadersReceived(details({ url: 'https://img.test/or-neither.png', size: 100 * 1024, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === orBase + 2, 'OR: file failing both gates is not saved');
+  ok((store.log || []).some((e) => e.status === 'skipped-filters'), 'OR double-failure logged as skipped-filters');
+  sandbox.fetch = rangeFetch(png800);
+  await nms.onHeadersReceived(details({ url: 'https://img.test/or-unknown-size.png', size: null, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === orBase + 3, 'OR: unknown size is rescued by passing dimensions');
+  await msg({ cmd: 'setSettings', settings: { imgDims: { enabled: true, minW: 600, minH: 600, maxW: 0, maxH: 0, logic: 'and' } } });
+  const andBase = downloadCalls.length;
+  await nms.onHeadersReceived(details({ url: 'https://img.test/and-unknown-size.png', size: null, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === andBase, 'AND: unknown size still skipped when saveUnknownSize is off');
+  ok((store.log || []).some((e) => e.status === 'skipped-unknown'), 'AND unknown-size skip logged');
+  ok(nms.getDefaults().imgDims.logic === 'and', 'default filter logic is AND (existing behavior unchanged)');
+  sandbox.fetch = undefined;
+
+  // 20. v1.6: interrupted download -> partial erased, dedup rolled back, retry allowed
+  await msg({ cmd: 'setSettings', settings: { enabled: true, minSizeKB: 0, maxSizeKB: 0, imgDims: { enabled: false } }, tabId: 9 });
+  downloadSearchResults = [];
+  downloadCalls.length = 0; eraseCalls.length = 0;
+  await nms.onHeadersReceived(details({ url: 'https://img.test/doomed.jpg', size: 90000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 1, 'doomed download starts');
+  const doomedId = nextDlId - 1;
+  ok(nms.getSavedUrls().has('https://img.test/doomed.jpg'), 'URL claimed while downloading');
+  listeners.dlChanged({ id: doomedId, state: { current: 'interrupted' } });
+  await tick(); await tick(); await tick();
+  ok(eraseCalls.length === 1 && eraseCalls[0].id === doomedId, 'interrupted download is erased (partial removed from disk)');
+  ok(!nms.getSavedUrls().has('https://img.test/doomed.jpg'), 'interrupted URL released so a later request retries');
+  ok(![...nms.getSavedFiles().keys()].some((k) => k.endsWith('/doomed.jpg')), 'interrupted file removed from the dedup cache');
+  ok((store.log || []).some((e) => e.status === 'interrupted'), 'interruption logged');
+  downloadCalls.length = 0;
+  await nms.onHeadersReceived(details({ url: 'https://img.test/doomed.jpg', size: 90000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 1, 're-request after interruption downloads again');
+  const retryId = nextDlId - 1;
+  ok(nms.getPendingDownloads().has(retryId), 'retry download tracked while in flight');
+  listeners.dlChanged({ id: retryId, state: { current: 'complete' } });
+  await tick();
+  ok(!nms.getPendingDownloads().has(retryId), 'completed download removed from the pending map');
+
+  // 21. v1.6: backfill skips interrupted entries; removeSavedFile unit
+  downloadSearchResults = [
+    { filename: 'C:\\D\\netsaver\\2026-10-01\\x.com\\ok.jpg', url: 'https://x.com/ok.jpg', fileSize: 5, state: 'complete' },
+    { filename: 'C:\\D\\netsaver\\2026-10-01\\x.com\\part.jpg', url: 'https://x.com/part.jpg', fileSize: 5, state: 'interrupted' },
+    { filename: 'C:\\D\\netsaver\\2026-10-01\\x.com\\busy.jpg', url: 'https://x.com/busy.jpg', fileSize: 5, state: 'in_progress' },
+  ];
+  const r4 = await msg({ cmd: 'scanExisting' });
+  ok(r4.added === 1, 'scanExisting seeds only the completed entry');
+  ok(nms.getSavedFiles().has('netsaver/2026-10-01/x.com/ok.jpg'), 'completed entry cached');
+  ok(!nms.getSavedFiles().has('netsaver/2026-10-01/x.com/part.jpg'), 'interrupted entry NOT cached as saved');
+  nms.addSavedFile('netsaver/2026-10-01/x.com/gone.jpg', 'https://x.com/gone.jpg', 5000);
+  ok(nms.isDuplicate('netsaver/2026-10-02/y.com/gone.jpg', 5000) === true, 'cached file dedups before removal');
+  nms.removeSavedFile('netsaver/2026-10-01/x.com/gone.jpg');
+  ok(nms.isDuplicate('netsaver/2026-10-02/y.com/gone.jpg', 5000) === false, 'removeSavedFile drops the dedup entry');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (failures.length) { console.log('failures:', failures.join('; ')); process.exit(1); }

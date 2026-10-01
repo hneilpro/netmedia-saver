@@ -16,6 +16,15 @@
  * skipped-segment log status; optional image dimension gates (min/max
  * width/height) via a tiny Range-request header probe — unknown dimensions
  * never block a save. Default min file size lowered 200KB -> 75KB.
+ * v1.6: atomic in-flight dedup claims (fixes the "photo.jpg / photo (1).jpg /
+ * photo (2).jpg" duplicates: two webRequest events for the same file used to
+ * pass the dedup check before either download started, and Chrome's `uniquify`
+ * then renamed the second copy); interrupted downloads are erased (partial
+ * file deleted) and their dedup records rolled back so a re-request retries
+ * cleanly; download-history backfill no longer seeds interrupted entries;
+ * custom-folder writes delete truncated files on failure; image filters gain
+ * an AND/OR combine mode ("File size AND dimensions" vs "File size OR
+ * dimensions").
  */
 
 const DEFAULTS = {
@@ -26,6 +35,7 @@ const DEFAULTS = {
   skipSegments: true,      // skip DASH/HLS fMP4 media segments (unplayable without the init segment)
   imgDims: {               // image dimension gates; max* = 0 means no upper limit
     enabled: true, minW: 600, minH: 600, maxW: 0, maxH: 0,
+    logic: 'and',           // 'and' = size AND dims must pass; 'or' = either passes
   },
   saveUnknownSize: true,   // save when no Content-Length is present
   subfolder: 'netsaver/{date}', // template: {date} {host} {kind}
@@ -63,6 +73,16 @@ let queue = [];
 let activeCount = 0;
 let sessionSaved = 0;
 let sessionBytes = 0;
+// v1.6: in-flight claims. MV3 dispatches each onHeadersReceived event as its
+// own task, so the synchronous prefix of onHeadersReceived (everything before
+// the first await) runs atomically. Claiming the URL + save path there closes
+// the race where two events for the same file — an identical URL re-fired, or
+// different URLs mapping to one save path (Instagram serves one basename under
+// many signed query strings) — both passed the dedup check before either
+// download started, and Chrome's `uniquify` then renamed the second copy to
+// "photo (1).jpg".
+let inflightPaths = new Map(); // relPath -> [{ size }] claimed but not finished
+const pendingDownloads = new Map(); // chrome.downloads id -> { url, relPath }
 
 /* ---------- storage ---------- */
 
@@ -118,6 +138,9 @@ async function backfillFromDownloads(limit) {
       } catch (e) { resolve([]); }
     });
     for (const it of items) {
+      // v1.6: never seed interrupted or in-progress entries — the old code
+      // cached partial files as "saved", so they were never retried.
+      if (it.state && it.state !== 'complete') continue;
       const fn = String(it.filename || '').replace(/\\/g, '/');
       const idx = fn.toLowerCase().indexOf('netsaver/');
       if (idx < 0) continue;
@@ -245,6 +268,67 @@ function isDuplicate(relPath, sizeBytes) {
   const entries = basenameIndex.get(basenameOf(relPath).toLowerCase());
   if (!entries) return false;
   return entries.some((e) => sizeClose(e.size, sizeBytes));
+}
+
+// v1.6: size gate as a pure decision — 'pass' | 'fail-size' | 'fail-too-large' | 'fail-unknown'
+function sizeGate(sizeBytes) {
+  if (sizeBytes !== null) {
+    const minBytes = (settings.minSizeKB || 0) * 1024;
+    if (sizeBytes < minBytes) return 'fail-size';
+    const maxKB = settings.maxSizeKB || 0;
+    if (maxKB > 0 && sizeBytes > maxKB * 1024) return 'fail-too-large';
+    return 'pass';
+  }
+  return settings.saveUnknownSize ? 'pass' : 'fail-unknown';
+}
+
+function sizeSkipStatus(gate) {
+  return gate === 'fail-too-large' ? 'skipped-too-large'
+    : gate === 'fail-unknown' ? 'skipped-unknown' : 'skipped-size';
+}
+
+// Claim a URL + save path synchronously (atomic — see the note on
+// inflightPaths). The path claim is released when the task finishes (runTask
+// finally); the URL claim lives on as the permanent dedup record. Use
+// releaseAll() to roll both back when a later gate rejects the file.
+function claimInFlight(url, relPath, sizeBytes) {
+  savedUrls.add(url);
+  const entry = { size: sizeBytes ?? null };
+  if (!inflightPaths.has(relPath)) inflightPaths.set(relPath, []);
+  inflightPaths.get(relPath).push(entry);
+  persistSoon();
+  let pathReleased = false;
+  const releasePath = () => {
+    if (pathReleased) return;
+    pathReleased = true;
+    const arr = inflightPaths.get(relPath);
+    if (arr) {
+      const i = arr.indexOf(entry);
+      if (i >= 0) arr.splice(i, 1);
+      if (!arr.length) inflightPaths.delete(relPath);
+    }
+  };
+  return {
+    releasePath,
+    releaseAll() { releasePath(); savedUrls.delete(url); persistSoon(); },
+  };
+}
+
+function inFlightMatch(relPath, sizeBytes) {
+  const arr = inflightPaths.get(relPath);
+  return !!arr && arr.some((e) => sizeClose(e.size, sizeBytes));
+}
+
+function removeSavedFile(relPath) {
+  if (!relPath || !savedFiles.has(relPath)) return;
+  savedFiles.delete(relPath);
+  const base = basenameOf(relPath).toLowerCase();
+  const arr = basenameIndex.get(base);
+  if (arr) {
+    const i = arr.findIndex((e) => e.relPath === relPath);
+    if (i >= 0) arr.splice(i, 1);
+    if (!arr.length) basenameIndex.delete(base);
+  }
 }
 
 /* ---------- classification ---------- */
@@ -537,9 +621,15 @@ async function fetchAndWrite(task) {
   const buf = await res.arrayBuffer();
   const finalName = await uniquifyName(dir, name);
   const fh = await dir.getFileHandle(finalName, { create: true });
-  const w = await fh.createWritable();
-  await w.write(buf);
-  await w.close();
+  try {
+    const w = await fh.createWritable();
+    await w.write(buf);
+    await w.close();
+  } catch (e) {
+    // v1.6: don't leave a truncated file behind when the write fails.
+    try { await dir.removeEntry(finalName); } catch (e2) { /* ignore */ }
+    throw e;
+  }
   return { skipped: false, bytes: buf.byteLength, savedRelPath: dirPath ? `${dirPath}/${finalName}` : finalName };
 }
 
@@ -562,7 +652,6 @@ function processQueue() {
 }
 
 async function runTask(task) {
-  savedUrls.add(task.url); // claim early so repeats don't double-queue
   try {
     let bytes = task.sizeBytes;
     let savedRelPath = task.relPath;
@@ -577,7 +666,8 @@ async function runTask(task) {
       bytes = res.bytes;
       if (res.savedRelPath) savedRelPath = res.savedRelPath;
     } else {
-      await downloadsSave(task);
+      const dlId = await downloadsSave(task);
+      pendingDownloads.set(dlId, { url: task.url, relPath: savedRelPath });
       // byte count confirmed on completion via onChanged; use header meanwhile
     }
     addSavedFile(savedRelPath, task.url, bytes || null);
@@ -595,6 +685,10 @@ async function runTask(task) {
       try { await runTask(task); } finally { settings.useCustomFolder = keep; }
       return;
     }
+  } finally {
+    // The URL stays claimed as the permanent dedup record; only the
+    // in-flight path claim is released.
+    if (task.claim) task.claim.releasePath();
   }
 }
 
@@ -611,18 +705,50 @@ function downloadsSave(task) {
   });
 }
 
-// downloads.download resolves at START, not completion — finalize via onChanged
+// downloads.download resolves at START, not completion — finalize via onChanged.
+// The resolved id is tracked so an interrupted download can be cleaned up.
 chrome.downloads.onChanged.addListener((delta) => {
-  if (delta.state && (delta.state.current === 'complete' || delta.state.current === 'interrupted')) {
-    chrome.downloads.search({ id: delta.id }, (items) => {
-      const it = items && items[0];
-      if (!it) return;
-      if (delta.state.current === 'interrupted') {
-        addLog({ url: it.url, kind: '?', size: it.fileSize || null, status: 'error', error: it.error || 'interrupted' });
+  if (!delta.state) return;
+  const st = delta.state.current;
+  if (st !== 'complete' && st !== 'interrupted') return;
+  const pend = pendingDownloads.get(delta.id);
+  pendingDownloads.delete(delta.id);
+  if (st === 'interrupted') {
+    (async () => {
+      // v1.6: an interrupted download leaves a partial file behind. erase()
+      // removes the history entry AND deletes the partial from disk
+      // (removeFile only works on completed items). Then roll back the dedup
+      // records — the old code kept them, so a re-request believed the
+      // partial was a good copy and never retried.
+      try {
+        await new Promise((resolve, reject) => {
+          try {
+            chrome.downloads.erase({ id: delta.id }, () => {
+              if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+              else resolve();
+            });
+          } catch (e) { reject(e); }
+        });
+      } catch (e) { /* partial may already be gone — keep going */ }
+      if (pend) {
+        removeSavedFile(pend.relPath);
+        savedUrls.delete(pend.url);
+        persistSoon();
       }
-      // On complete the bytes were already counted from headers; nothing to do.
-    });
+      chrome.downloads.search({ id: delta.id }, (items) => {
+        const it = items && items[0];
+        addLog({
+          url: (it && it.url) || (pend && pend.url) || '',
+          kind: '?',
+          size: (it && it.fileSize) || null,
+          status: 'interrupted',
+          error: (it && it.error) || 'interrupted',
+          detail: 'partial file removed; a later request will retry it',
+        });
+      });
+    })().catch((e) => console.warn('[nmsaver]', e));
   }
+  // On complete the bytes were already counted from headers; nothing to do.
 });
 
 /* ---------- observer ---------- */
@@ -651,40 +777,78 @@ async function onHeadersReceived(details) {
     return;
   }
 
-  const minBytes = (settings.minSizeKB || 0) * 1024;
-  if (sizeBytes !== null) {
-    if (sizeBytes < minBytes) {
-      await addLog({ url, kind, size: sizeBytes, status: 'skipped-size' });
-      return;
-    }
-    const maxKB = settings.maxSizeKB || 0;
-    if (maxKB > 0 && sizeBytes > maxKB * 1024) {
-      await addLog({ url, kind, size: sizeBytes, status: 'skipped-too-large' });
-      return;
-    }
-  } else if (!settings.saveUnknownSize) {
-    await addLog({ url, kind, size: null, status: 'skipped-unknown' });
-    return;
-  }
-
   const relPath = buildRelPath(url, kind, contentType);
-  if (settings.skipExisting && isDuplicate(relPath, sizeBytes)) {
-    await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
+
+  // Duplicate suppression. Everything from here to the claim is synchronous,
+  // so the check and the claim are atomic with respect to other
+  // onHeadersReceived events (single-threaded event loop) — the fix for the
+  // (1)/(2) renamed duplicates.
+  if (settings.skipExisting) {
+    if (isDuplicate(relPath, sizeBytes)) {
+      await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
+      return;
+    }
+    if (inFlightMatch(relPath, sizeBytes)) {
+      await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate', detail: 'already being saved' });
+      return;
+    }
+  }
+
+  const imgCfg = settings.imgDims;
+  const dimsOn = kind === 'image' && imgCfg && imgCfg.enabled;
+  const logic = imgCfg && imgCfg.logic === 'or' ? 'or' : 'and';
+  const gate = sizeGate(sizeBytes);
+
+  if (!dimsOn) {
+    // Videos, audio, or the dimension filter switched off: the size gate alone
+    // decides, exactly as before.
+    if (gate !== 'pass') {
+      await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
+      return;
+    }
+    const claim = claimInFlight(url, relPath, sizeBytes);
+    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
     return;
   }
 
-  // v1.5: optional image dimension gates — one tiny Range request per image.
-  // Unknown dimensions never block the save.
-  const imgCfg = settings.imgDims;
-  if (kind === 'image' && imgCfg && imgCfg.enabled) {
+  if (logic === 'and') {
+    // Default: BOTH the file-size gate and the dimension gate must pass.
+    if (gate !== 'pass') {
+      await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
+      return;
+    }
+    const claim = claimInFlight(url, relPath, sizeBytes);
+    // v1.5: optional image dimension gates — one tiny Range request per image.
+    // Unknown dimensions never block the save.
     const dims = await probeImageDimensions(url);
     if (dims && !dimsPass(dims, imgCfg)) {
+      claim.releaseAll();
       await addLog({ url, kind, size: sizeBytes, status: 'skipped-dims', detail: `${dims.w}×${dims.h}px` });
       return;
     }
+    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    return;
   }
 
-  enqueue({ url, kind, contentType, sizeBytes, relPath });
+  // logic === 'or': save when the size gate OR the dimension gate passes.
+  if (gate === 'pass') {
+    const claim = claimInFlight(url, relPath, sizeBytes);
+    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    return;
+  }
+  const claim = claimInFlight(url, relPath, sizeBytes);
+  const dims = await probeImageDimensions(url);
+  if (dims && dimsPass(dims, imgCfg)) {
+    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    return;
+  }
+  // Neither gate passed. Unknown dimensions can't satisfy the OR side, so they
+  // count as a fail here (the size side already failed).
+  claim.releaseAll();
+  const maxTxt = settings.maxSizeKB > 0 ? `..${settings.maxSizeKB}KB` : '';
+  const sizePart = sizeBytes === null ? 'size unknown' : `${Math.round(sizeBytes / 1024)}KB not in ${settings.minSizeKB}KB${maxTxt}`;
+  const dimsPart = dims ? `${dims.w}×${dims.h}px out of range` : 'dims unknown';
+  await addLog({ url, kind, size: sizeBytes, status: 'skipped-filters', detail: `${sizePart}; ${dimsPart}` });
 }
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -775,12 +939,19 @@ if (typeof module !== 'undefined' && module.exports) {
     getDefaults: () => DEFAULTS,
     getSavedFiles: () => savedFiles,
     getSavedUrls: () => savedUrls,
+    getInflightPaths: () => inflightPaths,
+    getPendingDownloads: () => pendingDownloads,
     getTabEnabled: () => tabEnabled,
     getQueue: () => queue,
     getInstallType: () => installType,
     effectiveEnabled,
     isDuplicate,
     addSavedFile,
+    removeSavedFile,
+    claimInFlight,
+    inFlightMatch,
+    sizeGate,
+    sizeSkipStatus,
     classifyKind,
     sizeFromHeaders,
     isMediaSegment,
