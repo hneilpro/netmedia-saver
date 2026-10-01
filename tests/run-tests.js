@@ -89,7 +89,7 @@ function details({ url, size = null, range = null, tabId = 7, mime = 'image/jpeg
   else if (size !== null) headers.push({ name: 'content-length', value: String(size) });
   return { method: 'GET', url, tabId, statusCode, type, responseHeaders: headers };
 }
-const tick = () => new Promise((r) => setTimeout(r, 20));
+const tick = () => new Promise((r) => setTimeout(r, 700)); // outlives the 500ms coalesce debounce + mock download
 
 async function main() {
   await tick(); // let loadState() settle
@@ -586,8 +586,9 @@ async function main() {
     'smaller variant logged as skipped-duplicate');
 
   // 28. v1.8: srcset coalescing, small-first order — the larger latecomer
-  // replaces the still-queued smaller task (saturate the worker so the small
-  // one cannot start before the large one arrives).
+  // replaces the held smaller candidate (the 500ms debounce hold means the
+  // small one never starts before the large one arrives, even with a free
+  // worker; maxConcurrent=1 also keeps the queue path exercised).
   await msg({ cmd: 'setSettings', settings: { maxConcurrent: 1 } });
   downloadCalls.length = 0;
   const bA = nms.onHeadersReceived(details({ url: 'https://a.test/blocker.jpg', size: 90000, tabId: 9 }));
@@ -624,6 +625,39 @@ async function main() {
   await nms.onHeadersReceived(details({ url: 'https://b.test/expire.jpg?v=2', size: 500000, tabId: 9 }));
   await tick();
   ok(downloadCalls.length === 2, 'after the window expires, a different-sized same-basename file saves again');
+
+  // 31. v1.8: post-hold queue replace — a larger variant arriving AFTER the
+  // debounce fired, while the smaller task is still queued behind a stalled
+  // worker, replaces it via the queue-splice path.
+  await msg({ cmd: 'setSettings', settings: { maxConcurrent: 1 } });
+  downloadCalls.length = 0;
+  const realDownload = chrome.downloads.download;
+  let releaseBlocker = null;
+  chrome.downloads.download = (opts, cb) => {
+    if (opts.url.includes('qblock') && !releaseBlocker) {
+      const id = nextDlId++;
+      downloadCalls.push(opts);
+      releaseBlocker = () => cb(id); // stall: worker stays busy
+    } else realDownload(opts, cb);
+  };
+  const qSmallUrl = 'https://a.test/qburst.jpg?v=small';
+  const qLargeUrl = 'https://b.test/qburst.jpg?v=large';
+  await nms.onHeadersReceived(details({ url: 'https://a.test/qblock.jpg', size: 90000, tabId: 9 }));
+  await nms.onHeadersReceived(details({ url: qSmallUrl, size: 90000, tabId: 9 }));
+  await tick(); // holds fire: blocker downloading (stalled), small still queued
+  ok(downloadCalls.length === 1 && downloadCalls[0].url.includes('qblock'),
+    'blocker started while the smaller variant waits queued');
+  await nms.onHeadersReceived(details({ url: qLargeUrl, size: 500000, tabId: 9 }));
+  await tick();
+  ok(!nms.getSavedUrls().has(qSmallUrl), 'queued smaller URL released from the dedup set');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.url === qSmallUrl
+    && /replaced by larger/.test(e.detail || '')), 'queued smaller task logged as replaced');
+  releaseBlocker();
+  await tick();
+  chrome.downloads.download = realDownload;
+  ok(downloadCalls.length === 2, 'blocker + one qburst variant downloaded');
+  ok(downloadCalls[1].url === qLargeUrl, 'larger variant replaced the queued smaller task');
+  await msg({ cmd: 'setSettings', settings: { maxConcurrent: 5 } });
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (failures.length) { console.log('failures:', failures.join('; ')); process.exit(1); }

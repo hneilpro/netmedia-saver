@@ -28,14 +28,16 @@ No build step — it's plain HTML/JS.
 - **Srcset coalescing:** Instagram serves one image at several resolutions as
   different signed URLs under one basename, with sizes more than 1% apart —
   the old basename dedup let them all through and Chrome renamed the extras
-  to `photo (1).jpg`. Now, when a candidate maps to a basename seen in the
-  last ~2.5 s, only the **largest** is kept (by file size, tie-break by probed
-  dimensions) and the rest log as `skipped-duplicate`. A larger latecomer
-  replaces a still-queued smaller download (its claim is released); if the
-  smaller one already started downloading it can't be taken back, so the
-  latecomer is skipped instead. The window is in-memory only (~2.5 s, not a
-  setting); afterwards the old behavior returns — a genuinely different-sized
-  same-basename file saves again.
+  to `photo (1).jpg`. Now, the first candidate for a basename is held for a
+  short debounce (~0.5 s) so srcset siblings arriving in the same burst can
+  be compared *before* anything starts downloading; only the **largest** is
+  then kept (by file size, tie-break by probed dimensions) and the rest log
+  as `skipped-duplicate`. A larger latecomer replaces a still-queued smaller
+  download (its claim is released); if the smaller one already started
+  downloading it can't be taken back, so the latecomer is skipped instead. A
+  basename seen in the last ~2.5 s is not re-saved. The window is in-memory
+  only (not a setting); afterwards the old behavior returns — a genuinely
+  different-sized same-basename file saves again.
 - **Byte-range URLs are stripped before download:** Instagram video requests
   carry `bytestart`/`byteend` query params (206 partial content). Re-fetching
   that URL verbatim saved only the requested byte range — a corrupt partial

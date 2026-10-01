@@ -410,8 +410,17 @@ function inFlightMatch(relPath, sizeBytes) {
 // latecomer replaces a still-queued smaller task (its claim is released); a
 // smaller task that already started downloading can't be taken back, so the
 // latecomer is skipped instead. In-memory only, nothing persisted.
+// v1.8: the coalescer used to enqueue the FIRST variant immediately, so with an
+// empty queue the smaller variant started downloading before its larger srcset
+// siblings even arrived — largest-wins only worked when the queue was already
+// saturated. Fix: hold the first candidate for a short debounce so
+// near-simultaneous same-basename variants can be compared BEFORE any download
+// starts. The hold is in-memory only; the service worker stays alive for ~30s
+// after any network event, so the 500ms timer always fires in practice.
 const COALESCE_MS = 2500;
-const coalesceRecent = new Map(); // lowercased basename -> { ts, url, kind, sizeBytes, dims, task, claim }
+const COALESCE_DELAY_MS = 500;
+const coalesceRecent = new Map(); // lowercased basename -> { firstTs, best, queued, task, timer }
+// best: { url, kind, contentType, sizeBytes, relPath, claim, dims }
 
 // >0 when a is the better candidate to keep, <0 when b is, 0 on a tie (keep first).
 function betterCandidate(a, b) {
@@ -428,8 +437,11 @@ function betterCandidate(a, b) {
 
 // Route a gate-passed candidate through the coalesce window, then enqueue the
 // winner. entry: { url, kind, contentType, sizeBytes, relPath, claim, dims }.
-// The decision + all mutations happen before the first await, so concurrent
-// candidates for one basename are serialized correctly.
+// The first candidate for a basename is HELD for COALESCE_DELAY_MS so srcset
+// siblings arriving in the same burst can be compared before anything starts
+// downloading; the largest held candidate is then enqueued. The decision +
+// all mutations happen before the first await, so concurrent candidates for
+// one basename are serialized correctly.
 async function coalesceEnqueue(entry) {
   if (!settings.skipExisting) {
     enqueue({ url: entry.url, kind: entry.kind, contentType: entry.contentType, sizeBytes: entry.sizeBytes, relPath: entry.relPath, claim: entry.claim, dims: entry.dims || null, done: false });
@@ -437,22 +449,35 @@ async function coalesceEnqueue(entry) {
   }
   const base = basenameOf(entry.relPath).toLowerCase();
   const now = Date.now();
-  let prev = coalesceRecent.get(base);
-  if (prev && now - prev.ts >= COALESCE_MS) { coalesceRecent.delete(base); prev = null; }
-  if (prev) {
-    if (prev.task.done) {
+  let rec = coalesceRecent.get(base);
+  if (rec && now - rec.firstTs >= COALESCE_MS) { clearTimeout(rec.timer); coalesceRecent.delete(base); rec = null; }
+  if (rec && !rec.queued) {
+    // Still inside the debounce hold: compare against the held best.
+    if (betterCandidate(entry, rec.best) <= 0) {
+      entry.claim.releaseAll();
+      await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — kept the larger file' });
+      return;
+    }
+    const old = rec.best;
+    old.claim.releaseAll();
+    addLog({ url: old.url, kind: old.kind, size: old.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — replaced by larger file' });
+    rec.best = entry;
+    return; // the timer enqueues the winner
+  }
+  if (rec) {
+    if (rec.task.done) {
       // The earlier variant already finished saving inside the window — keep
       // the file on disk rather than re-saving as "photo (1).jpg".
       entry.claim.releaseAll();
       await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'already saved moments ago' });
       return;
     }
-    if (betterCandidate(entry, prev) <= 0) {
+    if (betterCandidate(entry, rec.best) <= 0) {
       entry.claim.releaseAll();
       await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — kept the larger file' });
       return;
     }
-    const qi = queue.indexOf(prev.task);
+    const qi = queue.indexOf(rec.task);
     if (qi < 0) {
       // Already downloading — it can't be taken back.
       entry.claim.releaseAll();
@@ -460,14 +485,30 @@ async function coalesceEnqueue(entry) {
       return;
     }
     queue.splice(qi, 1);
-    prev.claim.releaseAll();
-    addLog({ url: prev.url, kind: prev.kind, size: prev.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — replaced by larger file' });
+    rec.best.claim.releaseAll();
+    addLog({ url: rec.best.url, kind: rec.best.kind, size: rec.best.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — replaced by larger file' });
+  } else {
+    rec = { firstTs: now, best: entry, queued: false, task: null, timer: null };
+    rec.timer = setTimeout(() => fireCoalesced(base, rec), COALESCE_DELAY_MS);
+    coalesceRecent.set(base, rec);
+    if (coalesceRecent.size > 5000) {
+      for (const [k, v] of coalesceRecent) if (now - v.firstTs >= COALESCE_MS) { clearTimeout(v.timer); coalesceRecent.delete(k); }
+    }
+    return;
   }
   const task = { url: entry.url, kind: entry.kind, contentType: entry.contentType, sizeBytes: entry.sizeBytes, relPath: entry.relPath, claim: entry.claim, dims: entry.dims || null, done: false };
-  coalesceRecent.set(base, { ts: now, url: task.url, kind: task.kind, sizeBytes: task.sizeBytes, dims: task.dims, task, claim: task.claim });
-  if (coalesceRecent.size > 5000) {
-    for (const [k, v] of coalesceRecent) if (now - v.ts >= COALESCE_MS) coalesceRecent.delete(k);
-  }
+  rec.best = entry;
+  rec.task = task;
+  enqueue(task);
+}
+
+// The debounce hold expired: enqueue the largest held candidate for this basename.
+function fireCoalesced(base, rec) {
+  if (coalesceRecent.get(base) !== rec || rec.queued) return;
+  rec.queued = true;
+  const e = rec.best;
+  const task = { url: e.url, kind: e.kind, contentType: e.contentType, sizeBytes: e.sizeBytes, relPath: e.relPath, claim: e.claim, dims: e.dims || null, done: false };
+  rec.task = task;
   enqueue(task);
 }
 
