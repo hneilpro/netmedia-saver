@@ -12,7 +12,36 @@ you scroll, with no clicks per file.
 3. Click **Load unpacked** and select this folder
 4. Pin the extension, then click its icon to configure
 
+Works in **Microsoft Edge** too (Chromium) — same steps via `edge://extensions`.
+
 No build step — it's plain HTML/JS.
+
+## v1.8.0 — duplicate + partial-file fixes (Instagram)
+
+- **True atomic dedup claims:** the URL check + claim now run in the
+  synchronous prefix of the network observer — before the first `await` — so
+  two near-simultaneous requests for the same URL can no longer both slip
+  through and produce `photo (1).jpg` copies. (The v1.6 comment's atomicity
+  reasoning was wrong: the first `await` is the tab-enabled check, which sits
+  *before* the old claim.) Claims are rolled back when a later gate rejects
+  the file, so nothing is permanently marked from a rejected request.
+- **Srcset coalescing:** Instagram serves one image at several resolutions as
+  different signed URLs under one basename, with sizes more than 1% apart —
+  the old basename dedup let them all through and Chrome renamed the extras
+  to `photo (1).jpg`. Now, when a candidate maps to a basename seen in the
+  last ~2.5 s, only the **largest** is kept (by file size, tie-break by probed
+  dimensions) and the rest log as `skipped-duplicate`. A larger latecomer
+  replaces a still-queued smaller download (its claim is released); if the
+  smaller one already started downloading it can't be taken back, so the
+  latecomer is skipped instead. The window is in-memory only (~2.5 s, not a
+  setting); afterwards the old behavior returns — a genuinely different-sized
+  same-basename file saves again.
+- **Byte-range URLs are stripped before download:** Instagram video requests
+  carry `bytestart`/`byteend` query params (206 partial content). Re-fetching
+  that URL verbatim saved only the requested byte range — a corrupt partial
+  file that looked like a failed save. Those params (and `range=`) are now
+  stripped from the download/fetch URL. The size gate still uses the
+  `Content-Range` total, so the minimum-size filter keeps working on videos.
 
 ## v1.7.0 — where to capture: this tab, website whitelist, website blacklist
 
@@ -163,9 +192,25 @@ permission so the service worker can see page hosts.
 - Silent auto-save is confined to **Downloads** unless you pick a custom
   folder once (Chromium-only File System Access API).
 - Video that arrives as many `206` range requests: the size gate uses the
-  `Content-Range` total, and the full URL (not the range) is downloaded.
+  `Content-Range` total, and the byte-range query params (`bytestart` /
+  `byteend` / `range`) are stripped from the download URL so the full file is
+  fetched, not the partial range.
 - `chrome.downloads.download` resolves at download *start*; completion is
   tracked via `chrome.downloads.onChanged`.
+
+### Instagram notes (platform realities, not bugs)
+
+- The extension can only save what the browser actually **requests**.
+  Instagram's `srcset` means the full-resolution variant is often never
+  fetched — only the displayed resolution hits the network — so don't expect
+  originals. If an image never appears in the log at all, the browser simply
+  never requested it (cached render, or a resolution below your filters).
+- Video delivered as `blob:` URLs or MSE streams can't be re-fetched by
+  design (webRequest can't read bodies); those never save, whatever the
+  settings.
+- Instagram profile-grid thumbnails are small: with the default image
+  dimension filter (≥ 600×600 px) they log as `skipped-dims`. Lower the
+  minimums if you want the thumbnails too.
 - Needs `<all_urls>` host permission to observe traffic — that's what makes
   the network filter possible. Per-tab enable uses `activeTab` (not `tabs`),
   so the extension never sees browsing history — only the tab you clicked the

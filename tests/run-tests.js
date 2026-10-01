@@ -1,7 +1,8 @@
 /* NetMedia Saver unit tests — runs background.js (the real service worker
- * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.6
- * behavior: atomic in-flight dedup claims, interrupted-download cleanup and
- * dedup rollback, AND/OR image filter logic, plus the v1.5 behavior
+ * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.8
+ * behavior (atomic check-and-claim, srcset coalescing, byte-range URL
+ * stripping), the v1.6 behavior (interrupted-download cleanup and
+ * dedup rollback, AND/OR image filter logic), plus the v1.5 behavior
  * (stream-segment skip, image dimension gates) and the earlier v1.1–v1.4
  * behavior (typed min / optional max gates, origin-tab capture default,
  * basename dedup default, cacheFiles/scanExisting handlers, dev-mode cache
@@ -418,16 +419,19 @@ async function main() {
   await Promise.all([dup1, dup2]);
   await tick();
   ok(downloadCalls.length === 1, 'same basename + same size from different URLs downloads once (no (1) rename)');
-  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.detail === 'already being saved'),
-    'in-flight duplicate logged as skipped-duplicate');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && /kept the larger file/.test(e.detail || '')),
+    'srcset-coalesced duplicate logged as skipped-duplicate');
 
-  // 17. v1.6: same basename but genuinely different sizes -> both saved (Chrome uniquifies)
+  // 17. v1.8: same basename with genuinely different sizes, fired together ->
+  // the coalescer keeps only the largest (see tests 27-30 for both orders,
+  // the within-window repeat, and the post-window behavior).
   downloadCalls.length = 0;
-  const sz1 = nms.onHeadersReceived(details({ url: 'https://a.test/sizediff.jpg?v=1', size: 90000, tabId: 9 }));
-  const sz2 = nms.onHeadersReceived(details({ url: 'https://b.test/sizediff.jpg?v=2', size: 500000, tabId: 9 }));
+  const sz1 = nms.onHeadersReceived(details({ url: 'https://a.test/sizediff.jpg?v=large', size: 500000, tabId: 9 }));
+  const sz2 = nms.onHeadersReceived(details({ url: 'https://b.test/sizediff.jpg?v=small', size: 90000, tabId: 9 }));
   await Promise.all([sz1, sz2]);
   await tick();
-  ok(downloadCalls.length === 2, 'same basename with different sizes saves both (uniquify fallback kept)');
+  ok(downloadCalls.length === 1, 'same basename with different sizes inside the window saves only the largest');
+  ok(downloadCalls[0].url === 'https://a.test/sizediff.jpg?v=large', 'the larger variant is the one saved');
 
   // 18. v1.6: sizeGate unit tests
   const sg = nms.sizeGate;
@@ -512,6 +516,114 @@ async function main() {
   ok(nms.isDuplicate('netsaver/2026-10-02/y.com/gone.jpg', 5000) === true, 'cached file dedups before removal');
   nms.removeSavedFile('netsaver/2026-10-01/x.com/gone.jpg');
   ok(nms.isDuplicate('netsaver/2026-10-02/y.com/gone.jpg', 5000) === false, 'removeSavedFile drops the dedup entry');
+
+  // 22. v1.8: the dedup claim is synchronous — registered before the first await,
+  // so two near-simultaneous events for the same URL cannot both pass the check.
+  await msg({ cmd: 'setSettings', settings: { enabled: true, minSizeKB: 0, maxSizeKB: 0, imgDims: { enabled: false } }, tabId: 9 });
+  downloadCalls.length = 0;
+  const url22 = 'https://img.test/sync-claim.jpg';
+  const p22 = nms.onHeadersReceived(details({ url: url22, size: 90000, tabId: 9 }));
+  ok(nms.getSavedUrls().has(url22) === true,
+    'URL is claimed synchronously, before the first await (atomic check-and-claim)');
+  await p22; await tick();
+  ok(downloadCalls.length === 1, 'synchronously-claimed file still downloads exactly once');
+
+  // 23. v1.8: the claim is rolled back when a later gate rejects the file (disabled tab)
+  await msg({ cmd: 'setTabEnabled', tabId: 9, enabled: false });
+  const url23 = 'https://img.test/disabled-rollback.jpg';
+  await nms.onHeadersReceived(details({ url: url23, size: 90000, tabId: 9 }));
+  await tick();
+  ok(nms.getSavedUrls().has(url23) === false, 'claim rolled back when the tab gate rejects the file');
+  ok(downloadCalls.length === 1, 'disabled tab downloads nothing');
+  await msg({ cmd: 'setTabEnabled', tabId: 9, enabled: true });
+
+  // 24. v1.8: stripRangeParams unit tests
+  const srp = nms.stripRangeParams;
+  ok(srp('https://cdn.test/v.mp4?bytestart=0&byteend=1023&_nc=abc') === 'https://cdn.test/v.mp4?_nc=abc',
+    'bytestart/byteend stripped, other params kept');
+  ok(srp('https://cdn.test/v.mp4?range=0-99') === 'https://cdn.test/v.mp4',
+    'range= param stripped');
+  ok(srp('https://cdn.test/v.mp4?a=1&b=2') === 'https://cdn.test/v.mp4?a=1&b=2',
+    'URL without range params returned unchanged');
+  ok(srp('not a url') === 'not a url', 'unparseable URL passes through');
+
+  // 25. v1.8: a 206 video URL with byte-range params downloads the FULL file
+  downloadCalls.length = 0;
+  await nms.onHeadersReceived({
+    method: 'GET',
+    url: 'https://v.test/clip.mp4?bytestart=1048576&byteend=2097151&oh=abc',
+    tabId: 9, statusCode: 206, type: 'xmlhttprequest',
+    responseHeaders: [
+      { name: 'content-type', value: 'video/mp4' },
+      { name: 'content-range', value: 'bytes 1048576-2097151/5242880' },
+    ],
+  });
+  await tick();
+  ok(downloadCalls.length === 1, 'byte-range video URL still downloads');
+  ok(downloadCalls[0].url === 'https://v.test/clip.mp4?oh=abc',
+    'download URL has bytestart/byteend stripped');
+  ok(!/[?&](bytestart|byteend|range)=/.test(downloadCalls[0].url),
+    'no range params leak into the download URL');
+
+  // 26. v1.8: betterCandidate unit tests
+  const bc = nms.betterCandidate;
+  ok(bc({ sizeBytes: 500, dims: null }, { sizeBytes: 100, dims: null }) > 0, 'larger size wins');
+  ok(bc({ sizeBytes: 100, dims: null }, { sizeBytes: 500, dims: null }) < 0, 'smaller size loses');
+  ok(bc({ sizeBytes: null, dims: null }, { sizeBytes: 100, dims: null }) < 0, 'unknown size loses to known size');
+  ok(bc({ sizeBytes: 100, dims: { w: 100, h: 100 } }, { sizeBytes: 100, dims: { w: 200, h: 200 } }) < 0,
+    'equal size: larger probed dims win the tie-break');
+  ok(bc({ sizeBytes: 100, dims: null }, { sizeBytes: 100, dims: null }) === 0, 'exact tie keeps the first');
+
+  // 27. v1.8: srcset coalescing, large-first order — the smaller latecomer is skipped
+  downloadCalls.length = 0;
+  const l1 = nms.onHeadersReceived(details({ url: 'https://a.test/burst1.jpg?v=large', size: 500000, tabId: 9 }));
+  const l2 = nms.onHeadersReceived(details({ url: 'https://b.test/burst1.jpg?v=small', size: 90000, tabId: 9 }));
+  await Promise.all([l1, l2]);
+  await tick();
+  ok(downloadCalls.length === 1, 'srcset burst (large first) downloads exactly once');
+  ok(downloadCalls[0].url === 'https://a.test/burst1.jpg?v=large', 'the larger variant is the one saved');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.url === 'https://b.test/burst1.jpg?v=small'),
+    'smaller variant logged as skipped-duplicate');
+
+  // 28. v1.8: srcset coalescing, small-first order — the larger latecomer
+  // replaces the still-queued smaller task (saturate the worker so the small
+  // one cannot start before the large one arrives).
+  await msg({ cmd: 'setSettings', settings: { maxConcurrent: 1 } });
+  downloadCalls.length = 0;
+  const bA = nms.onHeadersReceived(details({ url: 'https://a.test/blocker.jpg', size: 90000, tabId: 9 }));
+  const bS = nms.onHeadersReceived(details({ url: 'https://a.test/burst2.jpg?v=small', size: 90000, tabId: 9 }));
+  const bL = nms.onHeadersReceived(details({ url: 'https://b.test/burst2.jpg?v=large', size: 500000, tabId: 9 }));
+  await Promise.all([bA, bS, bL]);
+  await tick();
+  ok(downloadCalls.length === 2, 'blocker + one burst2 variant downloaded');
+  ok(downloadCalls[0].url === 'https://a.test/blocker.jpg', 'blocker downloaded first');
+  ok(downloadCalls[1].url === 'https://b.test/burst2.jpg?v=large', 'queued smaller task replaced by the larger variant');
+  ok(!nms.getSavedUrls().has('https://a.test/burst2.jpg?v=small'), 'replaced smaller URL released from the dedup set');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.url === 'https://a.test/burst2.jpg?v=small'
+    && /replaced by larger/.test(e.detail || '')), 'replaced smaller variant logged');
+  await msg({ cmd: 'setSettings', settings: { maxConcurrent: 5 } });
+
+  // 29. v1.8: a basename saved moments ago is not re-saved inside the window
+  downloadCalls.length = 0;
+  await nms.onHeadersReceived(details({ url: 'https://a.test/window.jpg?v=1', size: 90000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 1, 'first variant saved');
+  await nms.onHeadersReceived(details({ url: 'https://b.test/window.jpg?v=2', size: 500000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 1, 'same basename saved moments ago is not re-saved inside the window');
+  ok((store.log || []).some((e) => e.status === 'skipped-duplicate' && e.url === 'https://b.test/window.jpg?v=2'),
+    'within-window repeat logged as skipped-duplicate');
+
+  // 30. v1.8: after the coalesce window expires, a different-sized same-basename
+  // file saves again (the old "genuinely different sizes" behavior is kept).
+  downloadCalls.length = 0;
+  await nms.onHeadersReceived(details({ url: 'https://a.test/expire.jpg?v=1', size: 90000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 1, 'first variant saved');
+  await new Promise((r) => setTimeout(r, 2600)); // outlive the 2.5s coalesce window
+  await nms.onHeadersReceived(details({ url: 'https://b.test/expire.jpg?v=2', size: 500000, tabId: 9 }));
+  await tick();
+  ok(downloadCalls.length === 2, 'after the window expires, a different-sized same-basename file saves again');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (failures.length) { console.log('failures:', failures.join('; ')); process.exit(1); }

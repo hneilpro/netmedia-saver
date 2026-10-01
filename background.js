@@ -25,6 +25,19 @@
  * custom-folder writes delete truncated files on failure; image filters gain
  * an AND/OR combine mode ("File size AND dimensions" vs "File size OR
  * dimensions").
+ * v1.8: the URL check + claim now run in the TRUE synchronous prefix of
+ * onHeadersReceived (before the first await — the v1.6 comment's atomicity
+ * reasoning was wrong: the first await is the tab-enabled check, which sits
+ * before the old claim, so near-simultaneous same-URL events could both pass
+ * whenever that check took more than a microtask); claims are rolled back when
+ * a later gate rejects the file. New srcset coalescing: Instagram serves one
+ * image at several resolutions as different signed URLs under one basename at
+ * sizes more than 1% apart, so the old basename dedup let them all through —
+ * now a short window per basename keeps only the largest (size, then probed
+ * dims) and logs the rest as skipped-duplicate. Byte-range query params
+ * (bytestart/byteend/range — Instagram video XHRs) are stripped from the URL
+ * before downloading, so a 206 partial URL no longer saves a corrupt partial
+ * file; the size gate still uses the Content-Range total.
  */
 
 const DEFAULTS = {
@@ -76,14 +89,11 @@ let queue = [];
 let activeCount = 0;
 let sessionSaved = 0;
 let sessionBytes = 0;
-// v1.6: in-flight claims. MV3 dispatches each onHeadersReceived event as its
-// own task, so the synchronous prefix of onHeadersReceived (everything before
-// the first await) runs atomically. Claiming the URL + save path there closes
-// the race where two events for the same file — an identical URL re-fired, or
-// different URLs mapping to one save path (Instagram serves one basename under
-// many signed query strings) — both passed the dedup check before either
-// download started, and Chrome's `uniquify` then renamed the second copy to
-// "photo (1).jpg".
+// v1.6: in-flight claims. (v1.8: the URL check + claimInFlight now run in the
+// true synchronous prefix of onHeadersReceived — everything before the first
+// await — which is what makes the check-and-claim atomic. MV3 dispatches each
+// onHeadersReceived event as its own task, so that prefix runs to completion
+// before any other event's prefix starts.)
 let inflightPaths = new Map(); // relPath -> [{ size }] claimed but not finished
 const pendingDownloads = new Map(); // chrome.downloads id -> { url, relPath }
 
@@ -389,6 +399,96 @@ function inFlightMatch(relPath, sizeBytes) {
   return !!arr && arr.some((e) => sizeClose(e.size, sizeBytes));
 }
 
+/* ---------- srcset coalescing (v1.8) ---------- */
+
+// Instagram serves one image at several resolutions as different signed URLs
+// that map to the SAME basename at sizes more than 1% apart, so the v1.1/v1.6
+// basename dedup lets them all through and Chrome's `uniquify` renames the
+// extras to "photo (1).jpg". Fix: a short window per basename (below). While a
+// basename has a recent candidate, keep only the LARGEST (by sizeBytes,
+// tie-break by probed dims) and log the rest as skipped-duplicate. A larger
+// latecomer replaces a still-queued smaller task (its claim is released); a
+// smaller task that already started downloading can't be taken back, so the
+// latecomer is skipped instead. In-memory only, nothing persisted.
+const COALESCE_MS = 2500;
+const coalesceRecent = new Map(); // lowercased basename -> { ts, url, kind, sizeBytes, dims, task, claim }
+
+// >0 when a is the better candidate to keep, <0 when b is, 0 on a tie (keep first).
+function betterCandidate(a, b) {
+  const as = a.sizeBytes, bs = b.sizeBytes;
+  if (as !== null && bs !== null) {
+    if (as !== bs) return as > bs ? 1 : -1;
+  } else if (as !== null) return 1;
+  else if (bs !== null) return -1;
+  const aa = a.dims ? a.dims.w * a.dims.h : 0;
+  const bb = b.dims ? b.dims.w * b.dims.h : 0;
+  if (aa !== bb) return aa > bb ? 1 : -1;
+  return 0;
+}
+
+// Route a gate-passed candidate through the coalesce window, then enqueue the
+// winner. entry: { url, kind, contentType, sizeBytes, relPath, claim, dims }.
+// The decision + all mutations happen before the first await, so concurrent
+// candidates for one basename are serialized correctly.
+async function coalesceEnqueue(entry) {
+  if (!settings.skipExisting) {
+    enqueue({ url: entry.url, kind: entry.kind, contentType: entry.contentType, sizeBytes: entry.sizeBytes, relPath: entry.relPath, claim: entry.claim, dims: entry.dims || null, done: false });
+    return;
+  }
+  const base = basenameOf(entry.relPath).toLowerCase();
+  const now = Date.now();
+  let prev = coalesceRecent.get(base);
+  if (prev && now - prev.ts >= COALESCE_MS) { coalesceRecent.delete(base); prev = null; }
+  if (prev) {
+    if (prev.task.done) {
+      // The earlier variant already finished saving inside the window — keep
+      // the file on disk rather than re-saving as "photo (1).jpg".
+      entry.claim.releaseAll();
+      await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'already saved moments ago' });
+      return;
+    }
+    if (betterCandidate(entry, prev) <= 0) {
+      entry.claim.releaseAll();
+      await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — kept the larger file' });
+      return;
+    }
+    const qi = queue.indexOf(prev.task);
+    if (qi < 0) {
+      // Already downloading — it can't be taken back.
+      entry.claim.releaseAll();
+      await addLog({ url: entry.url, kind: entry.kind, size: entry.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — earlier file already saving' });
+      return;
+    }
+    queue.splice(qi, 1);
+    prev.claim.releaseAll();
+    addLog({ url: prev.url, kind: prev.kind, size: prev.sizeBytes, status: 'skipped-duplicate', detail: 'srcset variant — replaced by larger file' });
+  }
+  const task = { url: entry.url, kind: entry.kind, contentType: entry.contentType, sizeBytes: entry.sizeBytes, relPath: entry.relPath, claim: entry.claim, dims: entry.dims || null, done: false };
+  coalesceRecent.set(base, { ts: now, url: task.url, kind: task.kind, sizeBytes: task.sizeBytes, dims: task.dims, task, claim: task.claim });
+  if (coalesceRecent.size > 5000) {
+    for (const [k, v] of coalesceRecent) if (now - v.ts >= COALESCE_MS) coalesceRecent.delete(k);
+  }
+  enqueue(task);
+}
+
+/* ---------- byte-range URL stripping (v1.8) ---------- */
+
+// Instagram video XHRs carry bytestart/byteend query params (206 partial
+// content). Handing that URL verbatim to the downloads API / fetch would save
+// ONLY the requested byte range — a corrupt partial file that looks like a
+// failed save. Strip range params before downloading; the size gate already
+// used the Content-Range total, so nothing else changes.
+function stripRangeParams(url) {
+  try {
+    const u = new URL(url);
+    let changed = false;
+    for (const p of ['bytestart', 'byteend', 'range']) {
+      if (u.searchParams.has(p)) { u.searchParams.delete(p); changed = true; }
+    }
+    return changed ? u.toString() : url;
+  } catch (e) { return url; }
+}
+
 function removeSavedFile(relPath) {
   if (!relPath || !savedFiles.has(relPath)) return;
   savedFiles.delete(relPath);
@@ -686,7 +786,7 @@ async function fetchAndWrite(task) {
       return { skipped: true, bytes: 0, savedRelPath: rel }; // already in the folder — skip the fetch
     } catch { /* not there — proceed */ }
   }
-  const res = await fetch(task.url, { credentials: 'include' });
+  const res = await fetch(stripRangeParams(task.url), { credentials: 'include' });
   if (!res.ok) throw new Error(`http-${res.status}`);
   const buf = await res.arrayBuffer();
   const finalName = await uniquifyName(dir, name);
@@ -746,6 +846,11 @@ async function runTask(task) {
     updateBadge(); persistSoon();
     await addLog({ url: task.url, kind: task.kind, size: bytes || null, status: 'saved', via: settings.useCustomFolder ? 'folder' : 'downloads' });
   } catch (e) {
+    // v1.8: drop the coalesce entry so a later same-basename request isn't
+    // blocked by this failed attempt (guarded: only when the entry is ours).
+    const base = basenameOf(task.relPath || '').toLowerCase();
+    const cur = coalesceRecent.get(base);
+    if (cur && cur.task === task) coalesceRecent.delete(base);
     await addLog({ url: task.url, kind: task.kind, size: task.sizeBytes, status: 'error', error: String(e && e.message || e) });
     // Fall back to the Downloads pipeline if the custom folder failed
     if (settings.useCustomFolder && !task.retried) {
@@ -757,7 +862,8 @@ async function runTask(task) {
     }
   } finally {
     // The URL stays claimed as the permanent dedup record; only the
-    // in-flight path claim is released.
+    // in-flight path claim is released. done flags the coalesce entry.
+    task.done = true;
     if (task.claim) task.claim.releasePath();
   }
 }
@@ -765,7 +871,8 @@ async function runTask(task) {
 function downloadsSave(task) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
-      { url: task.url, filename: task.relPath || buildRelPath(task.url, task.kind, task.contentType), conflictAction: 'uniquify', saveAs: false },
+      // v1.8: strip byte-range params — a 206 partial URL must not be re-fetched verbatim.
+      { url: stripRangeParams(task.url), filename: task.relPath || buildRelPath(task.url, task.kind, task.contentType), conflictAction: 'uniquify', saveAs: false },
       (id) => {
         if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
         else if (typeof id === 'undefined') reject(new Error('download-rejected'));
@@ -803,6 +910,12 @@ chrome.downloads.onChanged.addListener((delta) => {
       if (pend) {
         removeSavedFile(pend.relPath);
         savedUrls.delete(pend.url);
+        // v1.8: drop the coalesce-window entry too, so a re-request retries
+        // instead of being skipped as "already saved moments ago" (guarded:
+        // only when the entry still belongs to this download).
+        const cbase = basenameOf(pend.relPath || '').toLowerCase();
+        const cur = coalesceRecent.get(cbase);
+        if (cur && cur.task && cur.task.url === pend.url) coalesceRecent.delete(cbase);
         persistSoon();
       }
       chrome.downloads.search({ id: delta.id }, (items) => {
@@ -825,7 +938,14 @@ chrome.downloads.onChanged.addListener((delta) => {
 
 async function onHeadersReceived(details) {
   const tabId = typeof details.tabId === 'number' ? details.tabId : -1;
-  if (!(await effectiveEnabled(tabId))) return; // silently ignore tabs that are disabled
+  // ---- v1.8: synchronous atomic prefix — NO awaits before the claim. ----
+  // MV3 dispatches each onHeadersReceived event as its own task, so this
+  // prefix runs to completion before any other event's prefix starts. The URL
+  // pre-filter + claimInFlight form a true atomic check-and-claim: two
+  // near-simultaneous events for the same URL cannot both pass, no matter how
+  // many awaits the gates below take. (The v1.6 comment claimed atomicity for
+  // the wrong reason: the first await was always the tab-enabled check, which
+  // sits BEFORE the old claim.)
   if (details.method !== 'GET') return;
   const url = details.url;
   if (!/^https?:\/\//i.test(url)) return; // skip blob:, data:, etc.
@@ -836,32 +956,27 @@ async function onHeadersReceived(details) {
   if (!kind || !settings.types[kind]) return;
 
   const sizeBytes = sizeFromHeaders(details);
+  const relPath = buildRelPath(url, kind, contentType);
+  const claim = claimInFlight(url, relPath, sizeBytes);
+  // ---- end of atomic prefix ----
+
+  if (!(await effectiveEnabled(tabId))) { claim.releaseAll(); return; } // silently ignore disabled tabs
 
   // v1.5: DASH/HLS fMP4 media segments look like ordinary video/mp4 responses
   // in the headers but are unplayable without the init segment — skip them
   // instead of filling the folder with "corrupted" files.
   if ((kind === 'video' || kind === 'audio') && settings.skipSegments && isMediaSegment(url, contentType)) {
-    savedUrls.add(url); // don't re-log repeats of the same chunk
-    persistSoon();
+    claim.releasePath(); // the URL stays claimed as the permanent dedup record; no download coming
     await addLog({ url, kind, size: sizeBytes, status: 'skipped-segment' });
     return;
   }
 
-  const relPath = buildRelPath(url, kind, contentType);
-
-  // Duplicate suppression. Everything from here to the claim is synchronous,
-  // so the check and the claim are atomic with respect to other
-  // onHeadersReceived events (single-threaded event loop) — the fix for the
-  // (1)/(2) renamed duplicates.
-  if (settings.skipExisting) {
-    if (isDuplicate(relPath, sizeBytes)) {
-      await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
-      return;
-    }
-    if (inFlightMatch(relPath, sizeBytes)) {
-      await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate', detail: 'already being saved' });
-      return;
-    }
+  // v1.8: same-basename history check. Same-basename bursts inside the
+  // coalesce window are handled by coalesceEnqueue at enqueue time.
+  if (settings.skipExisting && isDuplicate(relPath, sizeBytes)) {
+    claim.releaseAll();
+    await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
+    return;
   }
 
   const imgCfg = settings.imgDims;
@@ -873,21 +988,21 @@ async function onHeadersReceived(details) {
     // Videos, audio, or the dimension filter switched off: the size gate alone
     // decides, exactly as before.
     if (gate !== 'pass') {
+      claim.releaseAll();
       await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
       return;
     }
-    const claim = claimInFlight(url, relPath, sizeBytes);
-    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: null });
     return;
   }
 
   if (logic === 'and') {
     // Default: BOTH the file-size gate and the dimension gate must pass.
     if (gate !== 'pass') {
+      claim.releaseAll();
       await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
       return;
     }
-    const claim = claimInFlight(url, relPath, sizeBytes);
     // v1.5: optional image dimension gates — one tiny Range request per image.
     // Unknown dimensions never block the save.
     const dims = await probeImageDimensions(url);
@@ -896,20 +1011,18 @@ async function onHeadersReceived(details) {
       await addLog({ url, kind, size: sizeBytes, status: 'skipped-dims', detail: `${dims.w}×${dims.h}px` });
       return;
     }
-    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: dims || null });
     return;
   }
 
   // logic === 'or': save when the size gate OR the dimension gate passes.
   if (gate === 'pass') {
-    const claim = claimInFlight(url, relPath, sizeBytes);
-    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: null });
     return;
   }
-  const claim = claimInFlight(url, relPath, sizeBytes);
   const dims = await probeImageDimensions(url);
   if (dims && dimsPass(dims, imgCfg)) {
-    enqueue({ url, kind, contentType, sizeBytes, relPath, claim });
+    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims });
     return;
   }
   // Neither gate passed. Unknown dimensions can't satisfy the OR side, so they
@@ -1057,5 +1170,8 @@ if (typeof module !== 'undefined' && module.exports) {
     backfillFromDownloads,
     onHeadersReceived,
     onMessage,
+    stripRangeParams,
+    betterCandidate,
+    coalesceEnqueue,
   };
 }

@@ -73,6 +73,7 @@ function minimalJpeg(w, h, totalSize) {
 }
 fs.mkdirSync(path.join(SITEDIR, 'sig1'), { recursive: true });
 fs.writeFileSync(path.join(SITEDIR, 'race.jpg'), minimalJpeg(800, 600, 903894));
+fs.writeFileSync(path.join(SITEDIR, 'range.jpg'), minimalJpeg(800, 600, 903894)); // byte-range URL scenario
 fs.writeFileSync(path.join(SITEDIR, 'sig1/photo.jpg'), minimalJpeg(800, 600, 200000));
 fs.writeFileSync(path.join(SITEDIR, 'big-dims.png'), solidPng(800, 600));   // dims pass, size fails
 fs.writeFileSync(path.join(SITEDIR, 'small-dims.png'), solidPng(100, 100)); // both fail
@@ -86,6 +87,7 @@ const FIX = {
   and: 'and-dims.png',         // AND: size fails -> skipped-size
   folder: 'folder.jpg',        // custom-folder write
   fail: 'fail.jpg',            // custom-folder write failure
+  range: 'range.jpg',          // video-style URL with bytestart/byteend params
 };
 fs.copyFileSync(path.join(SITEDIR, 'race.jpg'), path.join(SITEDIR, FIX.doomed));
 fs.copyFileSync(path.join(SITEDIR, 'big-dims.png'), path.join(SITEDIR, FIX.and));
@@ -99,6 +101,23 @@ const server = http.createServer((req, res) => {
   if (u.pathname === '/sig1/photo.jpg' || u.pathname === '/sig2/photo.jpg') f = path.join(SITEDIR, 'sig1/photo.jpg');
   fs.readFile(f, (err, data) => {
     if (err) { res.writeHead(404); res.end(); return; }
+    const ctype = f.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    // Instagram-style byte-range query params: serve ONLY the requested range
+    // (206), so a client that re-fetches the raw URL gets a corrupt partial —
+    // the extension must strip these params before downloading.
+    const bs = u.searchParams.get('bytestart'), be = u.searchParams.get('byteend');
+    if (bs !== null || be !== null) {
+      const start = bs !== null ? parseInt(bs, 10) : 0;
+      const end = be !== null ? parseInt(be, 10) : data.length - 1;
+      const slice = data.slice(start, Math.min(end + 1, data.length));
+      res.writeHead(206, {
+        'Content-Type': ctype,
+        'Content-Length': slice.length,
+        'Content-Range': `bytes ${start}-${start + slice.length - 1}/${data.length}`,
+        'Accept-Ranges': 'bytes',
+      });
+      res.end(slice); return;
+    }
     const range = req.headers.range;
     if (range) {
       const m = /bytes=(\d+)-(\d*)/.exec(range);
@@ -265,7 +284,7 @@ async function main() {
     const r = await fetch(url, { method: 'HEAD' });
     const headers = [];
     r.headers.forEach((v, k) => headers.push({ name: k, value: v }));
-    return { url, method: 'GET', tabId: 7, type: 'xmlhttprequest', responseHeaders: headers };
+    return { url, method: 'GET', tabId: 7, type: 'xmlhttprequest', statusCode: r.status, responseHeaders: headers };
   }
   const fire = (url) => realEvent(url).then((d) => listeners.headers(d));
 
@@ -355,6 +374,18 @@ async function main() {
   const st6 = await msg({ cmd: 'getState' });
   ok(st6.log.some((e) => e.status === 'error' && e.url.includes(FIX.fail)),
     'custom folder: write failure logged as error');
+
+  // 6. Byte-range URLs (Instagram video style): the raw URL serves a 206
+  // partial, but the extension strips bytestart/byteend before downloading,
+  // so the FULL file lands on disk instead of a corrupt partial.
+  await msg({ cmd: 'setSettings', settings: { useCustomFolder: false, imgDims: { enabled: false } } });
+  await fire(`${BASE}/${FIX.range}?bytestart=0&byteend=99&oh=abc`);
+  await tick(4500);
+  files = listFiles(DLDIR);
+  const ranged = files.filter((f) => f.endsWith('range.jpg') && !f.includes('(1)'));
+  ok(ranged.length === 1, 'range-param URL saved exactly once');
+  ok(ranged.length === 1 && fs.statSync(path.join(DLDIR, ranged[0])).size === 903894,
+    'range-param URL saved the FULL 903894 bytes, not the 100-byte partial');
 
   console.log(`\n${pass} passed, ${fail} failed\n(dl dir: ${DLDIR}, custom dir: ${CUSTOMDIR})`);
   if (fail) { console.log('failures:', failures); process.exitCode = 1; }
