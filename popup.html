@@ -14,14 +14,18 @@
 </header>
 
 <section>
-  <div class="row label-row"><span>Minimum file size</span><span id="minVal" class="dim"></span></div>
-  <input type="range" id="minSize" min="0" max="5120" step="10" value="200">
+  <div class="row label-row"><span>File size</span></div>
+  <div class="row size-row">
+    <label>Min <input type="number" id="minSize" min="0" step="10" value="200"> KB</label>
+    <label>Max <input type="number" id="maxSize" min="0" step="10" placeholder="No limit"> KB</label>
+  </div>
   <div class="chips">
     <button data-kb="50">50 KB</button>
     <button data-kb="200">200 KB</button>
     <button data-kb="1024">1 MB</button>
     <button data-kb="5120">5 MB</button>
   </div>
+  <div class="hint dim">Min presets above, or type any value. Max is optional — leave empty for no upper limit.</div>
 </section>
 
 <section>
@@ -48,8 +52,30 @@
 </section>
 
 <section>
+  <div class="row label-row"><span>This tab</span><span id="tabHost" class="dim"></span></div>
+  <div class="row"><label><input type="checkbox" id="tabEnabled"> <span>Capture on this tab</span></label></div>
+  <div class="hint dim" id="tabHint"></div>
+</section>
+
+<section>
+  <div class="row label-row"><span>Duplicates</span></div>
+  <label class="row"><input type="checkbox" id="skipExisting"> <span>Skip files already in the folder</span></label>
+  <div class="row"><label><span class="dim">Match by&nbsp;</span>
+    <select id="skipScope">
+      <option value="basename">Filename (any subfolder)</option>
+      <option value="exact">Exact folder + filename</option>
+    </select></label>
+  </div>
+  <div class="row">
+    <button id="cacheExisting">Cache existing files</button>
+    <span id="cacheStatus" class="dim"></span>
+  </div>
+  <div class="hint dim">Scans the save folder and remembers files already there, so they won't be saved again.</div>
+</section>
+
+<section>
   <div class="row label-row"><span>This session</span>
-    <span><button id="resetStats" class="link">reset</button> · <button id="clearDedup" class="link">forget saved URLs</button></span>
+    <span><button id="resetStats" class="link">reset</button> · <button id="clearDedup" class="link">forget saved files</button></span>
   </div>
   <div class="row stats"><span id="statFiles">0 files</span><span id="statBytes" class="dim">0 B</span><span id="statQueue" class="dim"></span></div>
 </section>
