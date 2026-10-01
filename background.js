@@ -23,6 +23,7 @@ const DEFAULTS = {
   subfolder: 'netsaver/{date}', // template: {date} {host} {kind}
   useCustomFolder: false,  // true = write into File System Access dir handle
   customFolderName: '',    // display name of picked folder
+  extraFolderNames: [],   // display names of extra folders to include in "cache existing files" (handles in IndexedDB)
   maxConcurrent: 5,
   dedupLimit: 5000,
   skipExisting: true,      // don't re-save files already in the folder

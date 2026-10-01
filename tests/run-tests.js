@@ -132,6 +132,17 @@ async function main() {
   ok(cf.files.every((f) => typeof f.relPath === 'string'), 'getCachedFiles entries carry relPath');
   ok(cf.files.length <= 200, 'getCachedFiles caps the payload');
 
+  // 7. Extra folders: namespaced cacheFiles entries dedup against save-folder files
+  nms.addSavedFile('netsaver/2026-10-01/x.com/photo.jpg', 'https://x.com/photo.jpg', 100000);
+  const cf2 = await msg({ cmd: 'cacheFiles', files: [['extra/Photos/photo.jpg', 100500]] });
+  ok(cf2 && cf2.added === 1, 'cacheFiles accepts namespaced extra-folder entries');
+  ok(nms.isDuplicate('netsaver/2026-10-01/x.com/photo.jpg', 100500) === true,
+    'basename dedup matches a file known from an extra folder');
+  ok(nms.isDuplicate('extra/Photos/photo.jpg', 100000) === true,
+    'basename dedup works in both directions across namespaces');
+  ok(Array.isArray(nms.getSettings().extraFolderNames),
+    'settings carry extraFolderNames (default empty)');
+
   // 3. Min gate (typed value): 150KB skipped, 250KB saved
   downloadCalls.length = 0;
   await msg({ cmd: 'setSettings', settings: { minSizeKB: 200, maxSizeKB: 0 } });

@@ -10,13 +10,36 @@ function idbOpen() {
   });
 }
 async function storeDirHandle(handle) {
-  const db = await idbOpen();
-  return new Promise((resolve, reject) => {
+  return idbSet('dir', handle);
+}
+function idbSet(key, val) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
     const tx = db.transaction('handles', 'readwrite');
-    tx.objectStore('handles').put(handle, 'dir');
+    tx.objectStore('handles').put(val, key);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
-  });
+  }));
+}
+function idbGet(key) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const q = db.transaction('handles', 'readonly').objectStore('handles').get(key);
+    q.onsuccess = () => resolve(q.result ?? null);
+    q.onerror = () => reject(q.error);
+  }));
+}
+/* Extra folders to include in "cache existing files": [{ name, handle }]. */
+async function getExtraFolders() {
+  return (await idbGet('extraFolders')) || [];
+}
+async function setExtraFolders(arr) {
+  await idbSet('extraFolders', arr);
+  await push({ extraFolderNames: arr.map((f) => f.name) });
+}
+async function removeExtraFolder(i) {
+  const extras = await getExtraFolders();
+  extras.splice(i, 1);
+  await setExtraFolders(extras);
+  refresh();
 }
 
 function fmtBytes(n) {
@@ -31,6 +54,7 @@ let settings = null;
 let activeTabId = -1;
 let devSaveLocText = '';
 let devListLoaded = false;
+let lastExtraNames = null;
 
 function todayStr() {
   const d = new Date();
@@ -83,6 +107,26 @@ async function refresh() {
   document.querySelectorAll('.chips button').forEach((b) =>
     b.classList.toggle('on', parseInt(b.dataset.kb, 10) === settings.minSizeKB));
 
+  // Extra folders to include in "cache existing files" (re-render only on change
+  // so the 2s refresh can't swallow a click on a Remove button).
+  const namesKey = JSON.stringify(settings.extraFolderNames || []);
+  if (namesKey !== lastExtraNames) {
+    lastExtraNames = namesKey;
+    const ef = $('extraFolders');
+    ef.innerHTML = '';
+    for (const [i, name] of (settings.extraFolderNames || []).entries()) {
+      const li = document.createElement('li');
+      const nm = document.createElement('span');
+      nm.className = 'nm'; nm.textContent = name; nm.title = name;
+      const rm = document.createElement('button');
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', () => removeExtraFolder(i));
+      li.append(nm, rm);
+      ef.appendChild(li);
+    }
+    if (!ef.children.length) ef.innerHTML = '<li class="dim">None added yet.</li>';
+  }
+
   // Development-only cache inspection (unpacked installs)
   const dev = $('devSection');
   if (st.devMode) {
@@ -90,9 +134,11 @@ async function refresh() {
     const cs = st.cacheStats || { files: 0, urls: 0 };
     $('devFiles').textContent = `${cs.files} files`;
     $('devUrls').textContent = `${cs.urls} urls`;
-    devSaveLocText = settings.useCustomFolder
+    const extraN = (settings.extraFolderNames || []).length;
+    devSaveLocText = (settings.useCustomFolder
       ? `Custom folder: ${settings.customFolderName || '(no folder chosen yet)'}`
-      : `Downloads/${settings.subfolder.replaceAll('{date}', todayStr())}`;
+      : `Downloads/${settings.subfolder.replaceAll('{date}', todayStr())}`)
+      + (extraN ? ` (+ ${extraN} extra folder${extraN === 1 ? '' : 's'})` : '');
     $('devSaveLoc').textContent = devSaveLocText;
     $('devOpenFolder').style.display = settings.useCustomFolder ? 'none' : '';
     if (!devListLoaded) loadDevList();
@@ -235,21 +281,86 @@ document.addEventListener('DOMContentLoaded', () => {
     chrome.downloads.showDefaultFolder();
   });
 
+  $('addExtraFolder').addEventListener('click', async () => {
+    try {
+      // Read-only is enough: extra folders are scanned, never written to.
+      const dir = await window.showDirectoryPicker({ mode: 'read' });
+      const extras = await getExtraFolders();
+      const same = async (h) => h && h.isSameEntry && await h.isSameEntry(dir).catch(() => false);
+      if (await same(await idbGet('dir'))) {
+        alert('That is already the save folder — it is always scanned.');
+        return;
+      }
+      for (const f of extras) {
+        if (await same(f.handle)) { alert('That folder is already in the list.'); return; }
+      }
+      extras.push({ name: dir.name, handle: dir });
+      await setExtraFolders(extras);
+      refresh();
+    } catch (e) {
+      if (e && e.name !== 'AbortError') alert('Could not use that folder: ' + (e.message || e));
+    }
+  });
+
   $('cacheExisting').addEventListener('click', async () => {
     const btn = $('cacheExisting'), st = $('cacheStatus');
     btn.disabled = true;
     st.textContent = 'Scanning…';
     try {
       let total = 0;
+      const skipped = [];
+      const pending = [];
+      async function flush() {
+        if (!pending.length) return;
+        const r = await chrome.runtime.sendMessage({ cmd: 'cacheFiles', files: pending.splice(0, pending.length) });
+        total += (r && r.added) || 0;
+      }
+      // Walk one folder root, shipping [relPath, size] entries to the SW in chunks.
+      async function walkRoot(handle, prefix, label) {
+        let perm = await handle.queryPermission({ mode: 'read' });
+        if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'read' });
+        if (perm !== 'granted') throw new Error(`permission denied for "${label}"`);
+        async function walk(dir, dirPrefix) {
+          for await (const [name, h] of dir.entries()) {
+            const rel = dirPrefix ? `${dirPrefix}/${name}` : name;
+            if (h.kind === 'file') {
+              let size = null;
+              try { size = (await h.getFile()).size; } catch (e) { /* unreadable — cache by name only */ }
+              pending.push([prefix ? `${prefix}/${rel}` : rel, size]);
+              st.textContent = `Scanning ${label}… ${total + pending.length} files`;
+              if (pending.length >= 500) await flush();
+            } else if (h.kind === 'directory') {
+              await walk(h, rel);
+            }
+          }
+        }
+        await walk(handle, '');
+      }
+      const roots = [];
       if (settings.useCustomFolder) {
-        // Walk the real folder recursively. Runs in the popup (not the SW)
-        // because requesting folder permission needs a user gesture.
-        total = await walkAndCache((n) => { st.textContent = `Scanning… ${n} files`; });
+        const main = await idbGet('dir');
+        if (main) roots.push({ handle: main, prefix: '', label: 'save folder' });
       } else {
         const r = await chrome.runtime.sendMessage({ cmd: 'scanExisting' });
-        total = (r && r.added) || 0;
+        total += (r && r.added) || 0;
       }
-      st.textContent = total ? `Cached ${total} existing file${total === 1 ? '' : 's'} — they won't be re-saved.` : 'Nothing new found.';
+      // Extra folders are namespaced in the cache so they can't clobber the
+      // save folder's entries; basename dedup still matches across them.
+      for (const f of await getExtraFolders()) {
+        roots.push({ handle: f.handle, prefix: `extra/${f.name}`, label: f.name });
+      }
+      if (settings.useCustomFolder && !roots.length) throw new Error('no folder chosen yet');
+      for (const root of roots) {
+        try {
+          await walkRoot(root.handle, root.prefix, root.label);
+        } catch (e) {
+          skipped.push(root.label);
+        }
+      }
+      await flush();
+      let done = total ? `Cached ${total} existing file${total === 1 ? '' : 's'} — they won't be re-saved.` : 'Nothing new found.';
+      if (skipped.length) done += ` (${skipped.length} folder${skipped.length === 1 ? '' : 's'} skipped — permission denied)`;
+      st.textContent = done;
       if (total && settings && !$('devSection').hidden) { devListLoaded = false; loadDevList(); }
     } catch (e) {
       st.textContent = 'Scan failed: ' + (e && e.message || e);
@@ -259,44 +370,3 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   window.addEventListener('unload', () => clearInterval(t));
 });
-
-/* Recursively walk the picked custom folder and ship [relPath, size]
- * entries to the service worker in chunks. Returns total cached count. */
-async function walkAndCache(progress) {
-  const db = await idbOpen();
-  const handle = await new Promise((resolve, reject) => {
-    const tx = db.transaction('handles', 'readonly');
-    const q = tx.objectStore('handles').get('dir');
-    q.onsuccess = () => resolve(q.result || null);
-    q.onerror = () => reject(q.error);
-  });
-  if (!handle) throw new Error('no folder chosen yet');
-  let perm = await handle.queryPermission({ mode: 'read' });
-  if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'read' });
-  if (perm !== 'granted') throw new Error('folder permission denied');
-
-  const pending = [];
-  let total = 0;
-  async function flush() {
-    if (!pending.length) return;
-    const r = await chrome.runtime.sendMessage({ cmd: 'cacheFiles', files: pending.splice(0, pending.length) });
-    total += (r && r.added) || 0;
-  }
-  async function walk(dir, prefix) {
-    for await (const [name, h] of dir.entries()) {
-      const rel = prefix ? `${prefix}/${name}` : name;
-      if (h.kind === 'file') {
-        let size = null;
-        try { size = (await h.getFile()).size; } catch (e) { /* unreadable — cache by name only */ }
-        pending.push([rel, size]);
-        if (progress) progress(total + pending.length);
-        if (pending.length >= 500) await flush();
-      } else if (h.kind === 'directory') {
-        await walk(h, rel);
-      }
-    }
-  }
-  await walk(handle, '');
-  await flush();
-  return total;
-}

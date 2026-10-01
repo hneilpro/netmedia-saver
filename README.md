@@ -43,6 +43,16 @@ No build step — it's plain HTML/JS.
   capture for just the current tab; the global toggle still overrides
   everything. The toolbar tooltip reflects the effective state per tab.
 
+## What's new in 1.4.0
+
+- **Extra folders to remember:** the Duplicates section now has an "Extra
+  folders to remember" list with an **Add folder…** button. "Cache existing
+  files" scans these folders too (in both save modes), so files already in
+  them won't be re-saved. Extra folders are stored read-only, namespaced in
+  the cache (`extra/<FolderName>/…`) so they can't clobber the save folder's
+  entries, and basename dedup still matches across all of them. Adding the
+  save folder itself or the same folder twice is refused.
+
 ## What's new in 1.3.0
 
 - **Development-mode cache inspector:** when the extension is loaded unpacked,

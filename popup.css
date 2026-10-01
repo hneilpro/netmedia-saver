@@ -25,6 +25,10 @@ button.link { border: none; padding: 0; color: #3b82f6; }
 #log .ok { color: #16a34a; } #log .skip { color: #d97706; } #log .err { color: #dc2626; }
 #devFileList { list-style: none; margin: 6px 0 0; padding: 0; max-height: 150px; overflow-y: auto; }
 #devFileList li { padding: 5px 0; border-top: 1px solid #8882; font-size: 12px; word-break: break-all; }
+#extraFolders { list-style: none; margin: 4px 0; padding: 0; max-height: 110px; overflow-y: auto; }
+#extraFolders li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-top: 1px solid #8882; font-size: 12px; }
+#extraFolders li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#extraFolders li button { padding: 1px 8px; }
 footer { padding-top: 10px; font-size: 11px; }
 /* toggle switch */
 .switch { position: relative; width: 44px; height: 24px; }
