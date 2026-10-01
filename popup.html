@@ -16,16 +16,29 @@
 <section>
   <div class="row label-row"><span>File size</span></div>
   <div class="row size-row">
-    <label>Min <input type="number" id="minSize" min="0" step="10" value="200"> KB</label>
+    <label>Min <input type="number" id="minSize" min="0" step="10" value="75"> KB</label>
     <label>Max <input type="number" id="maxSize" min="0" step="10" placeholder="No limit"> KB</label>
   </div>
   <div class="chips">
     <button data-kb="50">50 KB</button>
+    <button data-kb="75">75 KB</button>
     <button data-kb="200">200 KB</button>
     <button data-kb="1024">1 MB</button>
     <button data-kb="5120">5 MB</button>
   </div>
   <div class="hint dim">Min presets above, or type any value. Max is optional — leave empty for no upper limit.</div>
+</section>
+
+<section>
+  <div class="row label-row"><span>Image dimensions</span></div>
+  <label class="row"><input type="checkbox" id="imgDimsEnabled"> <span>Filter images by dimensions</span></label>
+  <div class="row size-row">
+    <label>Min <input type="number" id="imgMinW" min="0" step="50" value="600"> × <input type="number" id="imgMinH" min="0" step="50" value="600"> px</label>
+  </div>
+  <div class="row size-row">
+    <label>Max <input type="number" id="imgMaxW" min="0" step="50" placeholder="No limit"> × <input type="number" id="imgMaxH" min="0" step="50" placeholder="No limit"> px</label>
+  </div>
+  <div class="hint dim">Images smaller than the minimum (or larger than the maximum, when set) are skipped. Needs one tiny extra request per image to read its header; images whose size can't be read are saved anyway.</div>
 </section>
 
 <section>
@@ -35,6 +48,7 @@
     <label><input type="checkbox" id="tVideo"> Video</label>
     <label><input type="checkbox" id="tAudio"> Audio</label>
   </div>
+  <label class="row"><input type="checkbox" id="skipSegments"> <span>Skip stream segments (DASH/HLS chunks)</span></label>
   <label class="row"><input type="checkbox" id="saveUnknown"> <span>Save files with unknown size</span></label>
 </section>
 

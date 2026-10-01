@@ -1,7 +1,9 @@
 /* NetMedia Saver unit tests — runs background.js (the real service worker
- * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.2
- * behavior: typed min / optional max gates, origin-tab capture default,
- * basename dedup default, cacheFiles/scanExisting handlers.
+ * source) in a vm sandbox with mocked chrome.* APIs. Covers the v1.5
+ * behavior: stream-segment skip, image dimension gates (probe + parsers),
+ * plus the earlier v1.1–v1.4 behavior (typed min / optional max gates,
+ * origin-tab capture default, basename dedup default, cacheFiles/scanExisting
+ * handlers, dev-mode cache inspector).
  * Run: node tests/run-tests.js  (exit 0 = all pass)
  */
 'use strict';
@@ -207,6 +209,128 @@ async function main() {
   const r3 = await msg({ cmd: 'scanExisting' });
   ok(r3.added === 1, 'scanExisting picks up the netsaver/ history entry only');
   ok(nms.getSavedFiles().has('netsaver/2026-09-30/x.com/old.jpg'), 'scanned entry stored by rel path');
+
+  // 10. v1.5 defaults: 75KB min, segment skip on, 600x600 image dims on
+  const d15 = nms.getDefaults();
+  ok(d15.minSizeKB === 75, 'default minSizeKB is 75KB');
+  ok(d15.skipSegments === true, 'segment skipping is on by default');
+  ok(d15.imgDims && d15.imgDims.enabled === true && d15.imgDims.minW === 600 && d15.imgDims.minH === 600,
+    'image dimension filter defaults to on, min 600x600');
+  ok(d15.imgDims.maxW === 0 && d15.imgDims.maxH === 0, 'image dimension maximums default to off (no limit)');
+
+  // 11. isMediaSegment unit tests
+  const seg = nms.isMediaSegment;
+  ok(seg('https://cdn.test/v/seg-12.m4s', 'video/mp4') === true, '.m4s URL is a segment');
+  ok(seg('https://cdn.test/v/seg-12.mp4', 'video/mp4') === true, 'seg-N.mp4 chunk name is a segment');
+  ok(seg('https://cdn.test/dash/chunk_ctvideo_cfm4s_seg-1.m4s', 'video/mp4') === true, 'dash chunk name is a segment');
+  ok(seg('https://cdn.test/v/frag7.mp4', 'video/mp4') === true, 'fragN name is a segment');
+  ok(seg('https://cdn.test/v/stream', 'video/iso.segment') === true, 'video/iso.segment content type is a segment');
+  ok(seg('https://cdn.test/a/seg-3.m4s', 'audio/mp4') === true, 'audio .m4s is a segment');
+  ok(seg('https://cdn.test/v/movie.mp4', 'video/mp4') === false, 'ordinary mp4 is not a segment');
+  ok(seg('https://cdn.test/v/segment.mp4', 'video/mp4') === false, '"segment" without digits is not a segment');
+  ok(seg('https://cdn.test/v/clip.ts', 'video/mp2t') === false, '.ts segments are kept (playable alone)');
+  ok(seg('https://cdn.test/v/trailer.mp4', 'video/mp4') === false, 'plain name is not a segment');
+  ok(seg('not a url', 'video/mp4') === false, 'unparseable URL is not a segment');
+
+  // 12. parseImageDimensions unit tests (crafted headers)
+  const parse = nms.parseImageDimensions;
+  const be32 = (v) => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+  const le16 = (v) => [v & 255, (v >>> 8) & 255];
+  const le32 = (v) => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  const U8 = (arr) => new Uint8Array(arr);
+  let dd = parse(U8([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13,
+    0x49, 0x48, 0x44, 0x52, ...be32(800), ...be32(600), 8, 2, 0, 0, 0]));
+  ok(dd && dd.w === 800 && dd.h === 600, 'PNG dimensions parsed (big-endian)');
+  dd = parse(U8([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, ...le16(320), ...le16(200), 0, 0, 0]));
+  ok(dd && dd.w === 320 && dd.h === 200, 'GIF dimensions parsed (little-endian)');
+  const app0 = [0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00];
+  const sof0 = [0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x01, 0x01, 0x11, 0x00];
+  dd = parse(U8([0xFF, 0xD8, ...app0, ...sof0, 0xFF, 0xD9]));
+  ok(dd && dd.w === 640 && dd.h === 480, 'JPEG SOF0 dimensions parsed after APP0');
+  dd = parse(U8([0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x40, 0x08, 0x01, 0xE0, 0x02, 0x80]));
+  ok(dd === null, 'truncated JPEG header yields null (fail open)');
+  const w1 = 1919, h1 = 1079; // VP8X stores canvas-1
+  dd = parse(U8([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x58, 10, 0, 0, 0, 0x00, 0, 0, 0,
+    w1 & 255, (w1 >> 8) & 255, (w1 >> 16) & 255, h1 & 255, (h1 >> 8) & 255, (h1 >> 16) & 255]));
+  ok(dd && dd.w === 1920 && dd.h === 1080, 'WebP VP8X canvas size parsed');
+  const packed = 99 | (99 << 14); // VP8L stores (w-1)/(h-1) packed, 14 bits each
+  dd = parse(U8([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x4C, 5, 0, 0, 0, 0x2F, ...le32(packed)]));
+  ok(dd && dd.w === 100 && dd.h === 100, 'WebP VP8L packed dimensions parsed');
+  dd = parse(U8([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x20, 10, 0, 0, 0, 0, 0, 0, 0x9D, 0x01, 0x2A, ...le16(800), ...le16(600)]));
+  ok(dd && dd.w === 800 && dd.h === 600, 'WebP VP8 lossy dimensions parsed');
+  dd = parse(U8([0x42, 0x4D, 0, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, ...le32(800), ...le32(600), 0, 0]));
+  ok(dd && dd.w === 800 && dd.h === 600, 'BMP dimensions parsed');
+  ok(parse(U8([1, 2, 3])) === null, 'tiny input yields null');
+  ok(parse(U8([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])) === null, 'unknown format yields null');
+
+  // dimsPass gate logic
+  ok(nms.dimsPass(null, { minW: 600, minH: 600 }) === true, 'unknown dims pass (fail open)');
+  ok(nms.dimsPass({ w: 800, h: 600 }, { minW: 600, minH: 600, maxW: 0, maxH: 0 }) === true, 'dims within min pass');
+  ok(nms.dimsPass({ w: 400, h: 600 }, { minW: 600, minH: 600, maxW: 0, maxH: 0 }) === false, 'narrow image fails minW');
+  ok(nms.dimsPass({ w: 800, h: 400 }, { minW: 600, minH: 600, maxW: 0, maxH: 0 }) === false, 'short image fails minH');
+  ok(nms.dimsPass({ w: 5000, h: 4000 }, { minW: 0, minH: 0, maxW: 4096, maxH: 4096 }) === false, 'huge image fails max gates');
+  ok(nms.dimsPass({ w: 5000, h: 4000 }, { minW: 0, minH: 0, maxW: 0, maxH: 0 }) === true, 'zero gates pass everything');
+
+  // 13. segment skip end-to-end
+  await msg({ cmd: 'setSettings', settings: { enabled: true, minSizeKB: 0, maxSizeKB: 0, skipSegments: true }, tabId: 9 });
+  const sb = downloadCalls.length;
+  await nms.onHeadersReceived(details({ url: 'https://cdn.test/v/seg-12.m4s', size: 777128, tabId: 9, mime: 'video/mp4', type: 'xmlhttprequest' }));
+  await tick();
+  ok(downloadCalls.length === sb, 'fMP4 segment is not downloaded');
+  ok((store.log || []).some((e) => e.status === 'skipped-segment'), 'segment skip logged as skipped-segment');
+  await nms.onHeadersReceived(details({ url: 'https://cdn.test/v/movie.mp4', size: 5 * 1024 * 1024, tabId: 9, mime: 'video/mp4', type: 'media' }));
+  await tick();
+  ok(downloadCalls.length === sb + 1, 'ordinary mp4 still downloads when segment skip is on');
+  await msg({ cmd: 'setSettings', settings: { skipSegments: false } });
+  const sb2 = downloadCalls.length;
+  await nms.onHeadersReceived(details({ url: 'https://cdn.test/v/seg-13.m4s', size: 700000, tabId: 9, mime: 'video/mp4', type: 'xmlhttprequest' }));
+  await tick();
+  ok(downloadCalls.length === sb2 + 1, 'segment downloads when skipSegments is off');
+
+  // 14. image dimension gate end-to-end (mocked Range fetch)
+  function rangeFetch(bytes, status = 206) {
+    return async () => {
+      let pos = 0;
+      return {
+        ok: status >= 200 && status < 300, status,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (pos >= bytes.length) return { done: true, value: undefined };
+              const end = Math.min(pos + 8192, bytes.length);
+              const slice = bytes.slice(pos, end); pos = end;
+              return { done: false, value: slice };
+            },
+            cancel: async () => {},
+          }),
+        },
+      };
+    };
+  }
+  const png800 = U8([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13,
+    0x49, 0x48, 0x44, 0x52, ...be32(800), ...be32(600), 8, 2, 0, 0, 0]);
+  const png100 = U8([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13,
+    0x49, 0x48, 0x44, 0x52, ...be32(100), ...be32(100), 8, 2, 0, 0, 0]);
+  await msg({ cmd: 'setSettings', settings: { minSizeKB: 0, maxSizeKB: 0, imgDims: { enabled: true, minW: 600, minH: 600, maxW: 0, maxH: 0 } } });
+  sandbox.fetch = rangeFetch(png100);
+  const db = downloadCalls.length;
+  await nms.onHeadersReceived(details({ url: 'https://img.test/tiny-dim.png', size: 90000, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === db, '100x100 image is skipped by the dimension gate');
+  ok((store.log || []).some((e) => e.status === 'skipped-dims' && e.detail === '100×100px'),
+    'dimension skip logged with the detected size');
+  sandbox.fetch = rangeFetch(png800);
+  await nms.onHeadersReceived(details({ url: 'https://img.test/big-dim.png', size: 90000, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === db + 1, '800x600 image passes the dimension gate');
+  sandbox.fetch = async () => { throw new Error('net down'); };
+  await nms.onHeadersReceived(details({ url: 'https://img.test/unknown-dim.png', size: 90000, tabId: 9, mime: 'image/png', type: 'image' }));
+  await tick();
+  ok(downloadCalls.length === db + 2, 'image with a failed probe still downloads (fail open)');
+  sandbox.fetch = undefined;
 
   console.log(`\n${pass} passed, ${fail} failed`);
   if (failures.length) { console.log('failures:', failures.join('; ')); process.exit(1); }

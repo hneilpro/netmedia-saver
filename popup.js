@@ -78,9 +78,16 @@ async function refresh() {
   // Don't clobber a field the user is actively typing in (refresh runs every 2s).
   if (document.activeElement !== $('minSize')) $('minSize').value = settings.minSizeKB;
   if (document.activeElement !== $('maxSize')) $('maxSize').value = settings.maxSizeKB > 0 ? settings.maxSizeKB : '';
+  const imgD = settings.imgDims || {};
+  $('imgDimsEnabled').checked = imgD.enabled !== false;
+  if (document.activeElement !== $('imgMinW')) $('imgMinW').value = imgD.minW || 0;
+  if (document.activeElement !== $('imgMinH')) $('imgMinH').value = imgD.minH || 0;
+  if (document.activeElement !== $('imgMaxW')) $('imgMaxW').value = imgD.maxW > 0 ? imgD.maxW : '';
+  if (document.activeElement !== $('imgMaxH')) $('imgMaxH').value = imgD.maxH > 0 ? imgD.maxH : '';
   $('tImage').checked = settings.types.image;
   $('tVideo').checked = settings.types.video;
   $('tAudio').checked = settings.types.audio;
+  $('skipSegments').checked = settings.skipSegments !== false;
   $('saveUnknown').checked = settings.saveUnknownSize;
   if (document.activeElement !== $('subfolder')) $('subfolder').value = settings.subfolder;
   $('locDl').checked = !settings.useCustomFolder;
@@ -153,7 +160,7 @@ async function refresh() {
     const size = e.size ? fmtBytes(e.size) : '?';
     const name = decodeURIComponent((e.url.split('/').pop() || e.url).split('?')[0]).slice(0, 60);
     li.innerHTML = `<span class="${cls}">●</span> ${e.kind} · ${size} · ${escapeHtml(name)}`;
-    li.title = e.url + (e.error ? `\n${e.error}` : '');
+    li.title = e.url + (e.detail ? `\n${e.detail}` : '') + (e.error ? `\n${e.error}` : '');
     ul.appendChild(li);
   }
 }
@@ -212,6 +219,11 @@ function clampKB(v) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
+function clampInt(v) {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   refresh();
   const t = setInterval(refresh, 2000);
@@ -234,7 +246,23 @@ document.addEventListener('DOMContentLoaded', () => {
   $('tImage').addEventListener('change', (e) => push({ types: { image: e.target.checked } }));
   $('tVideo').addEventListener('change', (e) => push({ types: { video: e.target.checked } }));
   $('tAudio').addEventListener('change', (e) => push({ types: { audio: e.target.checked } }));
+  $('skipSegments').addEventListener('change', (e) => push({ skipSegments: e.target.checked }).then(refresh));
   $('saveUnknown').addEventListener('change', (e) => push({ saveUnknownSize: e.target.checked }));
+  const pushDims = (patch) => push({ imgDims: { ...(settings.imgDims || {}), ...patch } });
+  const dimVal = (k, isMax) => {
+    const v = (settings.imgDims || {})[k] || 0;
+    return isMax ? (v > 0 ? v : '') : v;
+  };
+  $('imgDimsEnabled').addEventListener('change', (e) => pushDims({ enabled: e.target.checked }).then(refresh));
+  for (const [id, key, isMax] of [['imgMinW', 'minW', false], ['imgMinH', 'minH', false], ['imgMaxW', 'maxW', true], ['imgMaxH', 'maxH', true]]) {
+    $(id).addEventListener('change', (e) => {
+      const raw = String(e.target.value).trim();
+      if (isMax && raw === '') { pushDims({ [key]: 0 }).then(refresh); return; } // empty = no limit
+      const v = clampInt(raw);
+      if (v === null) { e.target.value = dimVal(key, isMax); return; } // invalid — restore
+      pushDims({ [key]: v }).then(refresh);
+    });
+  }
   $('skipExisting').addEventListener('change', (e) => push({ skipExisting: e.target.checked }).then(refresh));
   $('skipScope').addEventListener('change', (e) => push({ skipScope: e.target.value }).then(refresh));
   $('tabEnabled').addEventListener('change', async (e) => {

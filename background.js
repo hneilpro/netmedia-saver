@@ -12,13 +12,21 @@
  * v1.2: optional maximum size gate; typed min/max inputs; capture defaults
  * to the tab the extension was enabled on (settings.enabledTabId);
  * cache-existing-files scan (cacheFiles chunks / scanExisting).
+ * v1.5: skip DASH/HLS fMP4 media segments (unplayable alone) with a clear
+ * skipped-segment log status; optional image dimension gates (min/max
+ * width/height) via a tiny Range-request header probe — unknown dimensions
+ * never block a save. Default min file size lowered 200KB -> 75KB.
  */
 
 const DEFAULTS = {
   enabled: false,          // the first explicit enable defines the capture tab (enabledTabId)
-  minSizeKB: 200,          // minimum file size gate
+  minSizeKB: 75,           // minimum file size gate
   maxSizeKB: 0,            // maximum file size gate; 0 = no limit
   types: { image: true, video: true, audio: true },
+  skipSegments: true,      // skip DASH/HLS fMP4 media segments (unplayable without the init segment)
+  imgDims: {               // image dimension gates; max* = 0 means no upper limit
+    enabled: true, minW: 600, minH: 600, maxW: 0, maxH: 0,
+  },
   saveUnknownSize: true,   // save when no Content-Length is present
   subfolder: 'netsaver/{date}', // template: {date} {host} {kind}
   useCustomFolder: false,  // true = write into File System Access dir handle
@@ -60,7 +68,11 @@ let sessionBytes = 0;
 
 async function loadState() {
   const s = await chrome.storage.local.get(['settings', 'savedUrls', 'savedFiles', 'stats', 'tabStates']);
-  if (s.settings) settings = { ...DEFAULTS, ...s.settings, types: { ...DEFAULTS.types, ...(s.settings.types || {}) } };
+  if (s.settings) settings = {
+    ...DEFAULTS, ...s.settings,
+    types: { ...DEFAULTS.types, ...((s.settings.types) || {}) },
+    imgDims: { ...DEFAULTS.imgDims, ...((s.settings.imgDims) || {}) },
+  };
   if (Array.isArray(s.savedUrls)) savedUrls = new Set(s.savedUrls);
   if (Array.isArray(s.savedFiles)) {
     savedFiles = new Map(s.savedFiles);
@@ -269,6 +281,172 @@ function sizeFromHeaders(details) {
   return null;
 }
 
+/* ---------- stream-segment detection (v1.5) ---------- */
+
+// DASH/HLS-style players fetch video/audio as many small fMP4 media segments
+// (moof+mdat, no init segment). Each one arrives as video/mp4 over XHR and
+// would pass the size gate — but a lone segment is unplayable, so saving it
+// just fills the folder with "corrupted" files. Detect the common shapes and
+// skip them with a clear log entry instead. MPEG-TS (.ts) segments are left
+// alone: they are individually playable.
+function isMediaSegment(url, contentType) {
+  const ct = (contentType || '').toLowerCase().split(';')[0].trim();
+  if (ct === 'video/iso.segment' || ct === 'audio/iso.segment') return true;
+  let path = '';
+  try { path = new URL(url).pathname.toLowerCase(); }
+  catch (e) { return false; }
+  if (path.endsWith('.m4s')) return true;
+  // seg-12 / segment_4 / chunk-3 / frag7 style chunk names — digits required
+  // so ordinary words like "segment.mp4" don't match
+  return /(^|[\/_.~-])(seg|segment|chunk|frag)[-_]?(\d+)(\.|$)/.test(path);
+}
+
+/* ---------- image dimension probing (v1.5) ---------- */
+
+// Reads just the head of an image (first 64KB via a Range request) and parses
+// its pixel dimensions. Pure parsers, no dependencies. Supported: JPEG, PNG,
+// GIF, WebP (VP8/VP8L/VP8X), BMP. Returns { w, h } or null when the format is
+// unsupported or the header is unreadable — unknown dimensions NEVER block a
+// save (fail open).
+const PROBE_BYTES = 65536;
+
+function parseImageDimensions(bytes) {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const n = b.length;
+  if (n < 10) return null; // smallest header we parse (GIF)
+  const u16be = (o) => (b[o] << 8) | b[o + 1];
+  const u16le = (o) => b[o] | (b[o + 1] << 8);
+  const u32be = (o) => (b[o] * 0x1000000) + ((b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]);
+  const u32le = (o) => b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] * 0x1000000);
+  const ascii = (o, len) => {
+    let s = '';
+    for (let i = 0; i < len && o + i < n; i++) s += String.fromCharCode(b[o + i]);
+    return s;
+  };
+
+  // PNG: 8-byte signature, IHDR chunk (BE32 width/height at 16/20)
+  if (b[0] === 0x89 && ascii(1, 3) === 'PNG' && n >= 24 && ascii(12, 4) === 'IHDR') {
+    return { w: u32be(16), h: u32be(20) };
+  }
+  // GIF: "GIF87a"/"GIF89a", LE16 width/height at 6/8
+  if (n >= 10 && (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a')) {
+    return { w: u16le(6), h: u16le(8) };
+  }
+  // WebP: "RIFF"...."WEBP", then a VP8 / VP8L / VP8X chunk
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') {
+    const fourcc = ascii(12, 4);
+    if (fourcc === 'VP8 ' && n >= 30) {
+      // lossy bitstream: 3-byte frame tag + start code 9D 01 2A at 23,
+      // then 14-bit width/height at 26/28
+      if (b[23] === 0x9d && b[24] === 0x01 && b[25] === 0x2a) {
+        return { w: u16le(26) & 0x3fff, h: u16le(28) & 0x3fff };
+      }
+    } else if (fourcc === 'VP8L' && n >= 25) {
+      // lossless: signature 0x2F at 20, then packed (w-1)/(h-1), 14 bits each
+      if (b[20] === 0x2f) {
+        const packed = u32le(21);
+        return { w: (packed & 0x3fff) + 1, h: ((packed >> 14) & 0x3fff) + 1 };
+      }
+    } else if (fourcc === 'VP8X' && n >= 30) {
+      // extended: 24-bit (canvas-1) width at 24, height at 27
+      return {
+        w: (b[24] | (b[25] << 8) | (b[26] << 16)) + 1,
+        h: (b[27] | (b[28] << 8) | (b[29] << 16)) + 1,
+      };
+    }
+    return null;
+  }
+  // BMP: "BM", DIB header; LE32 width/height at 18/22 (|height|: top-down)
+  if (b[0] === 0x42 && b[1] === 0x4d && n >= 26 && u32le(14) >= 40) {
+    const w = u32le(18);
+    const h = u32le(22);
+    const hh = h > 0x7fffffff ? 0x100000000 - h : h; // int32 abs
+    return { w, h: hh };
+  }
+  // JPEG: SOI, then walk markers to a SOF segment (BE16 h/w at +5/+7)
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    let o = 2;
+    while (o + 9 <= n) {
+      if (b[o] !== 0xff) break;
+      const m = b[o + 1];
+      if (m === 0xd9) break; // EOI
+      if (m === 0x01 || (m >= 0xd0 && m <= 0xd8)) { o += 2; continue; } // standalone
+      const len = u16be(o + 2);
+      if (len < 2 || o + 2 + len > n) break; // truncated header — give up
+      const isSOF = m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc;
+      if (isSOF) return { h: u16be(o + 5), w: u16be(o + 7) };
+      o += 2 + len;
+    }
+  }
+  return null;
+}
+
+// One tiny Range request per image; results cached per URL. Any failure
+// (no fetch, network error, timeout, unparseable) resolves to null so the
+// file is saved anyway.
+const dimCache = new Map(); // url -> {w,h} | null
+let probeActive = 0;
+const probeWaiters = [];
+function probeAcquire() {
+  if (probeActive < 4) { probeActive++; return Promise.resolve(); }
+  return new Promise((res) => probeWaiters.push(res));
+}
+function probeRelease() {
+  probeActive--;
+  const w = probeWaiters.shift();
+  if (w) { probeActive++; w(); }
+}
+
+async function probeImageDimensions(url) {
+  if (dimCache.has(url)) return dimCache.get(url);
+  if (typeof fetch !== 'function') return null;
+  await probeAcquire();
+  try {
+    const dims = await Promise.race([
+      (async () => {
+        const res = await fetch(url, {
+          headers: { Range: `bytes=0-${PROBE_BYTES - 1}` },
+          credentials: 'include',
+        });
+        if (!res.ok || !res.body || typeof res.body.getReader !== 'function') return null;
+        const reader = res.body.getReader();
+        const chunks = [];
+        let total = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          total += value.length;
+          if (total >= PROBE_BYTES) break;
+        }
+        try { await reader.cancel(); } catch (e) { /* ignore */ }
+        const buf = new Uint8Array(total);
+        let o = 0;
+        for (const c of chunks) { buf.set(c, o); o += c.length; }
+        return parseImageDimensions(buf);
+      })(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('probe-timeout')), 8000)),
+    ]);
+    if (dimCache.size > 2000) dimCache.clear();
+    dimCache.set(url, dims || null);
+    return dims || null;
+  } catch (e) {
+    return null;
+  } finally {
+    probeRelease();
+  }
+}
+
+function dimsPass(dims, cfg) {
+  if (!dims) return true; // unknown dimensions — save the file
+  const minW = cfg.minW | 0, minH = cfg.minH | 0, maxW = cfg.maxW | 0, maxH = cfg.maxH | 0;
+  if (minW > 0 && dims.w < minW) return false;
+  if (minH > 0 && dims.h < minH) return false;
+  if (maxW > 0 && dims.w > maxW) return false;
+  if (maxH > 0 && dims.h > maxH) return false;
+  return true;
+}
+
 /* ---------- filename building ---------- */
 
 function sanitize(s) {
@@ -462,6 +640,17 @@ async function onHeadersReceived(details) {
   if (!kind || !settings.types[kind]) return;
 
   const sizeBytes = sizeFromHeaders(details);
+
+  // v1.5: DASH/HLS fMP4 media segments look like ordinary video/mp4 responses
+  // in the headers but are unplayable without the init segment — skip them
+  // instead of filling the folder with "corrupted" files.
+  if ((kind === 'video' || kind === 'audio') && settings.skipSegments && isMediaSegment(url, contentType)) {
+    savedUrls.add(url); // don't re-log repeats of the same chunk
+    persistSoon();
+    await addLog({ url, kind, size: sizeBytes, status: 'skipped-segment' });
+    return;
+  }
+
   const minBytes = (settings.minSizeKB || 0) * 1024;
   if (sizeBytes !== null) {
     if (sizeBytes < minBytes) {
@@ -482,6 +671,17 @@ async function onHeadersReceived(details) {
   if (settings.skipExisting && isDuplicate(relPath, sizeBytes)) {
     await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
     return;
+  }
+
+  // v1.5: optional image dimension gates — one tiny Range request per image.
+  // Unknown dimensions never block the save.
+  const imgCfg = settings.imgDims;
+  if (kind === 'image' && imgCfg && imgCfg.enabled) {
+    const dims = await probeImageDimensions(url);
+    if (dims && !dimsPass(dims, imgCfg)) {
+      await addLog({ url, kind, size: sizeBytes, status: 'skipped-dims', detail: `${dims.w}×${dims.h}px` });
+      return;
+    }
   }
 
   enqueue({ url, kind, contentType, sizeBytes, relPath });
@@ -572,6 +772,7 @@ loadState();
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     getSettings: () => settings,
+    getDefaults: () => DEFAULTS,
     getSavedFiles: () => savedFiles,
     getSavedUrls: () => savedUrls,
     getTabEnabled: () => tabEnabled,
@@ -582,6 +783,10 @@ if (typeof module !== 'undefined' && module.exports) {
     addSavedFile,
     classifyKind,
     sizeFromHeaders,
+    isMediaSegment,
+    parseImageDimensions,
+    probeImageDimensions,
+    dimsPass,
     buildRelPath,
     basenameOf,
     backfillFromDownloads,

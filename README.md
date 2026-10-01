@@ -22,8 +22,10 @@ No build step — it's plain HTML/JS.
 - A request is saved when: the global toggle is on **for its tab** (by default
   only the tab the extension was enabled on captures — opt other tabs in via
   *Capture on this tab*), its type is enabled, and its size is **≥ the minimum
-  size** (default 200 KB) and **≤ the maximum size** when one is set.
+  size** (default 75 KB) and **≤ the maximum size** when one is set.
   Files with no `Content-Length` are saved too unless you turn that off.
+  Images additionally pass the **dimension filter** (on by default: ≥ 600×600 px;
+  optional maximums) — see below.
 - **Downloads-subfolder mode (default):** files are saved via
   `chrome.downloads.download` into `Downloads/<subfolder>/`, e.g.
   `Downloads/netsaver/2026-09-30/example.com/image/photo.jpg`.
@@ -42,6 +44,24 @@ No build step — it's plain HTML/JS.
 - **Per-tab enable (v1.1):** the popup's *This tab* section pauses or resumes
   capture for just the current tab; the global toggle still overrides
   everything. The toolbar tooltip reflects the effective state per tab.
+
+## What's new in 1.5.0
+
+- **Stream-segment skip:** DASH/HLS-style video/audio arrives as many small
+  fMP4 media segments (moof+mdat, no init segment) that each look like an
+  ordinary `video/mp4` response in the headers — saving one produced the
+  "corrupted" files. Segments (`.m4s` URLs, `seg-12`/`chunk-3`-style names,
+  `video/iso.segment` content type) are now skipped with a `skipped-segment`
+  log entry. MPEG-TS (`.ts`) segments still save — they're playable alone.
+- **Image dimension filter:** images can now be filtered by pixel size as well
+  as file size — min/max width and height, max optional (empty = no limit).
+  Defaults: on, minimum 600×600 px. The check costs one tiny `Range` request
+  (first 64 KB) per image; JPEG/PNG/GIF/WebP/BMP headers are parsed locally
+  with no dependencies. Images whose dimensions can't be read are saved
+  anyway — the probe never blocks a save. Too-small/too-big skips log as
+  `skipped-dims` with the detected dimensions.
+- **Default min file size lowered** 200 KB → 75 KB (existing installs keep
+  their saved value; change it in the popup).
 
 ## What's new in 1.4.0
 
@@ -97,7 +117,9 @@ No build step — it's plain HTML/JS.
 | Setting | What it does |
 |---|---|
 | On/off toggle | Off by default; turning it on makes the current tab the capture tab |
-| Min / Max file size | Type-in KB fields (presets for min); max empty = no upper limit |
+| Min / Max file size | Type-in KB fields (presets for min, default 75 KB); max empty = no upper limit |
+| Image dimensions | Optional min/max width/height filter for images (default on, min 600×600 px); max empty = no upper limit |
+| Skip stream segments | On = DASH/HLS fMP4 media segments are skipped instead of saved as unplayable files |
 | Images / Video / Audio | Which MIME families to capture |
 | Save files with unknown size | Off = skip responses with no `Content-Length` |
 | Downloads subfolder | Path template under Downloads |
@@ -112,7 +134,13 @@ No build step — it's plain HTML/JS.
 
 - **webRequest cannot read response bodies** — bytes are re-fetched from the
   URL. `blob:`/`data:` URLs, one-time signed URLs, and MSE-streamed media
-  (YouTube/Netflix-style) can't be captured this way.
+  (YouTube/Netflix-style) can't be captured this way. DASH/HLS **media
+  segments** (fMP4 chunks) are detected and skipped rather than saved as
+  unplayable files — capturing such streams properly needs a dedicated
+  downloader (e.g. yt-dlp) pointed at the page URL.
+- The **image dimension probe** adds one small `Range` request per image
+  (first 64 KB, parsed locally). Servers that block ranged requests simply
+  yield unknown dimensions, and the image is saved anyway.
 - Silent auto-save is confined to **Downloads** unless you pick a custom
   folder once (Chromium-only File System Access API).
 - Video that arrives as many `206` range requests: the size gate uses the
