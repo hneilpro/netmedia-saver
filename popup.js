@@ -29,6 +29,13 @@ function fmtBytes(n) {
 
 let settings = null;
 let activeTabId = -1;
+let devSaveLocText = '';
+let devListLoaded = false;
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 async function refresh() {
   // activeTab grants us the current tab after the user clicked the icon.
@@ -76,6 +83,23 @@ async function refresh() {
   document.querySelectorAll('.chips button').forEach((b) =>
     b.classList.toggle('on', parseInt(b.dataset.kb, 10) === settings.minSizeKB));
 
+  // Development-only cache inspection (unpacked installs)
+  const dev = $('devSection');
+  if (st.devMode) {
+    dev.hidden = false;
+    const cs = st.cacheStats || { files: 0, urls: 0 };
+    $('devFiles').textContent = `${cs.files} files`;
+    $('devUrls').textContent = `${cs.urls} urls`;
+    devSaveLocText = settings.useCustomFolder
+      ? `Custom folder: ${settings.customFolderName || '(no folder chosen yet)'}`
+      : `Downloads/${settings.subfolder.replaceAll('{date}', todayStr())}`;
+    $('devSaveLoc').textContent = devSaveLocText;
+    $('devOpenFolder').style.display = settings.useCustomFolder ? 'none' : '';
+    if (!devListLoaded) loadDevList();
+  } else {
+    dev.hidden = true;
+  }
+
   const ul = $('log'); ul.innerHTML = '';
   for (const e of st.log) {
     const li = document.createElement('li');
@@ -90,6 +114,44 @@ async function refresh() {
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* Dev-mode: list of cached files (most recent first, capped by the SW). */
+async function loadDevList() {
+  const ul = $('devFileList');
+  ul.innerHTML = '<li class="dim">Loading…</li>';
+  try {
+    const r = await chrome.runtime.sendMessage({ cmd: 'getCachedFiles' });
+    const files = (r && r.files) || [];
+    $('devListCount').textContent = r ? `showing ${files.length} of ${r.total}` : '';
+    ul.innerHTML = '';
+    if (!files.length) ul.innerHTML = '<li class="dim">Nothing cached yet.</li>';
+    for (const f of files) {
+      const li = document.createElement('li');
+      li.textContent = `${f.size != null ? fmtBytes(f.size) : '?'} · ${f.relPath}`;
+      ul.appendChild(li);
+    }
+    devListLoaded = true;
+  } catch (e) {
+    ul.innerHTML = '<li class="dim">Could not load the list.</li>';
+  }
+}
+
+async function copyText(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+  } catch (e) {
+    // Fallback for contexts where the async clipboard API is unavailable.
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (!ok) throw new Error('copy failed');
+  }
 }
 
 async function push(patch) {
@@ -157,6 +219,21 @@ document.addEventListener('DOMContentLoaded', () => {
   $('resetStats').addEventListener('click', () => chrome.runtime.sendMessage({ cmd: 'resetStats' }).then(refresh));
   $('clearDedup').addEventListener('click', () => chrome.runtime.sendMessage({ cmd: 'clearDedup' }));
   $('clearLog').addEventListener('click', () => chrome.runtime.sendMessage({ cmd: 'clearLog' }).then(refresh));
+  $('devRefreshList').addEventListener('click', () => { devListLoaded = false; loadDevList(); });
+  $('devCopyLoc').addEventListener('click', async () => {
+    const s = $('devLocStatus');
+    try {
+      await copyText(devSaveLocText);
+      s.textContent = 'Copied.';
+    } catch (e) {
+      s.textContent = 'Copy failed.';
+    }
+    setTimeout(() => { s.textContent = ''; }, 2000);
+  });
+  $('devOpenFolder').addEventListener('click', () => {
+    // Opens the Downloads root — Chrome offers no API to target the subfolder.
+    chrome.downloads.showDefaultFolder();
+  });
 
   $('cacheExisting').addEventListener('click', async () => {
     const btn = $('cacheExisting'), st = $('cacheStatus');
@@ -173,6 +250,7 @@ document.addEventListener('DOMContentLoaded', () => {
         total = (r && r.added) || 0;
       }
       st.textContent = total ? `Cached ${total} existing file${total === 1 ? '' : 's'} — they won't be re-saved.` : 'Nothing new found.';
+      if (total && settings && !$('devSection').hidden) { devListLoaded = false; loadDevList(); }
     } catch (e) {
       st.textContent = 'Scan failed: ' + (e && e.message || e);
     } finally {

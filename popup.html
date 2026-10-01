@@ -73,6 +73,22 @@
   <div class="hint dim">Scans the save folder and remembers files already there, so they won't be saved again.</div>
 </section>
 
+<section id="devSection" hidden>
+  <div class="row label-row"><span>Development</span><span class="dim">unpacked install</span></div>
+  <div class="row label-row"><span class="dim">Dedup cache location</span></div>
+  <div class="hint dim">chrome.storage.local → keys <b>savedFiles</b> / <b>savedUrls</b><br>Inspect live: chrome://extensions → NetMedia Saver → "service worker" → Application tab.</div>
+  <div class="row stats"><span id="devFiles">0 files</span><span id="devUrls" class="dim">0 urls</span></div>
+  <div class="row label-row"><span class="dim">Save folder</span></div>
+  <div class="hint dim" id="devSaveLoc"></div>
+  <div class="row">
+    <button id="devCopyLoc">Copy location</button>
+    <button id="devOpenFolder" title="Opens the Downloads folder — Chrome can't target the subfolder directly">Open folder</button>
+    <span id="devLocStatus" class="dim"></span>
+  </div>
+  <div class="row label-row"><span class="dim">Cached files</span><span><span id="devListCount" class="dim"></span> <button id="devRefreshList" class="link">refresh</button></span></div>
+  <ul id="devFileList"></ul>
+</section>
+
 <section>
   <div class="row label-row"><span>This session</span>
     <span><button id="resetStats" class="link">reset</button> · <button id="clearDedup" class="link">forget saved files</button></span>

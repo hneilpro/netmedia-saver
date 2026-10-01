@@ -49,6 +49,7 @@ const chrome = {
     setTitle: () => {},
   },
   runtime: { onMessage: { addListener: (fn) => { listeners.message = fn; } }, lastError: undefined },
+  management: { getSelf: async () => ({ installType: 'development' }) }, // unpacked load
 };
 
 /* ---------- load the real SW ---------- */
@@ -115,6 +116,21 @@ async function main() {
   ok(gs && gs.tabId === 9 && gs.tabEnabled === true, 'getState returns the requesting tab\'s effective state');
   const gs2 = await msg({ cmd: 'getState', tabId: 42 });
   ok(gs2 && gs2.tabEnabled === false, 'getState reports non-origin tabs as disabled');
+
+  // 5. Dev mode: unpacked install detected; cache stats served
+  ok(nms.getInstallType() === 'development', 'installType detected as development (unpacked)');
+  ok(gs.devMode === true, 'getState flags devMode for unpacked installs');
+  ok(gs.cacheStats && typeof gs.cacheStats.files === 'number' && typeof gs.cacheStats.urls === 'number',
+    'getState includes cache stats');
+
+  // 6. getCachedFiles: most-recent-first listing of the dedup cache
+  nms.addSavedFile('netsaver/2026-10-01/x.com/a.jpg', 'https://x.com/a.jpg', 100);
+  nms.addSavedFile('netsaver/2026-10-01/x.com/b.jpg', 'https://x.com/b.jpg', 200);
+  const cf = await msg({ cmd: 'getCachedFiles' });
+  ok(cf && cf.total === nms.getSavedFiles().size, 'getCachedFiles total matches the cache size');
+  ok(cf.files[0].relPath === 'netsaver/2026-10-01/x.com/b.jpg', 'getCachedFiles lists most recent first');
+  ok(cf.files.every((f) => typeof f.relPath === 'string'), 'getCachedFiles entries carry relPath');
+  ok(cf.files.length <= 200, 'getCachedFiles caps the payload');
 
   // 3. Min gate (typed value): 150KB skipped, 250KB saved
   downloadCalls.length = 0;

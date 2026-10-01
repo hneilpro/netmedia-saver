@@ -23,6 +23,8 @@ button.link { border: none; padding: 0; color: #3b82f6; }
 #log { list-style: none; margin: 6px 0 0; padding: 0; max-height: 150px; overflow-y: auto; }
 #log li { padding: 5px 0; border-top: 1px solid #8882; font-size: 12px; word-break: break-all; }
 #log .ok { color: #16a34a; } #log .skip { color: #d97706; } #log .err { color: #dc2626; }
+#devFileList { list-style: none; margin: 6px 0 0; padding: 0; max-height: 150px; overflow-y: auto; }
+#devFileList li { padding: 5px 0; border-top: 1px solid #8882; font-size: 12px; word-break: break-all; }
 footer { padding-top: 10px; font-size: 11px; }
 /* toggle switch */
 .switch { position: relative; width: 44px; height: 24px; }

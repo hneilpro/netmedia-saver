@@ -49,6 +49,7 @@ let savedUrls = new Set();   // dedup across SW restarts (persisted)
 let savedFiles = new Map();  // relPath -> { url, size } (persisted)
 let basenameIndex = new Map(); // lowercased basename -> [{ relPath, size }]
 let tabEnabled = {};         // tabId -> bool (persisted as tabStates)
+let installType = 'normal';  // 'development' when loaded unpacked (via chrome.management)
 let queue = [];
 let activeCount = 0;
 let sessionSaved = 0;
@@ -78,6 +79,15 @@ async function loadState() {
     }
     if (changed) persistTabStates();
   } catch (e) { /* tabs API unavailable — keep states */ }
+
+  // Detect unpacked (development) installs so the popup can show dev-only
+  // cache inspection. Needs the "management" permission.
+  try {
+    if (chrome.management && chrome.management.getSelf) {
+      const self = await chrome.management.getSelf();
+      if (self && self.installType) installType = self.installType;
+    }
+  } catch (e) { /* management unavailable — stay 'normal' */ }
 
   // Best-effort backfill: seed savedFiles from download history so files
   // saved before v1.1 (or while the SW was unloaded) are known.
@@ -487,7 +497,9 @@ chrome.webRequest.onHeadersReceived.addListener(
 async function onMessage(msg, _sender, sendResponse) {
   if (msg.cmd === 'getState') {
     const { log = [] } = await chrome.storage.local.get('log');
-    const out = { settings, sessionSaved, sessionBytes, queueLen: queue.length, activeCount, log: log.slice(0, 20), tabEnabled };
+    const out = { settings, sessionSaved, sessionBytes, queueLen: queue.length, activeCount, log: log.slice(0, 20), tabEnabled,
+      devMode: installType === 'development',
+      cacheStats: { urls: savedUrls.size, files: savedFiles.size } };
     if (typeof msg.tabId === 'number') {
       out.tabId = msg.tabId;
       out.tabEnabled = effectiveEnabled(msg.tabId);
@@ -528,6 +540,11 @@ async function onMessage(msg, _sender, sendResponse) {
     // On-demand scan of download history (Downloads-subfolder mode).
     const added = await backfillFromDownloads(5000);
     sendResponse({ ok: true, added });
+  } else if (msg.cmd === 'getCachedFiles') {
+    // Dev-mode inspection: most recent cached files (cap the payload).
+    const entries = [...savedFiles.entries()].slice(-200).reverse()
+      .map(([relPath, v]) => ({ relPath, size: v.size ?? null }));
+    sendResponse({ ok: true, total: savedFiles.size, files: entries });
   } else if (msg.cmd === 'resetStats') {
     sessionSaved = 0; sessionBytes = 0; updateBadge(); persistSoon();
     sendResponse({ ok: true });
@@ -558,6 +575,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getSavedUrls: () => savedUrls,
     getTabEnabled: () => tabEnabled,
     getQueue: () => queue,
+    getInstallType: () => installType,
     effectiveEnabled,
     isDuplicate,
     addSavedFile,

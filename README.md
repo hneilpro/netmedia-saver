@@ -43,6 +43,19 @@ No build step — it's plain HTML/JS.
   capture for just the current tab; the global toggle still overrides
   everything. The toolbar tooltip reflects the effective state per tab.
 
+## What's new in 1.3.0
+
+- **Development-mode cache inspector:** when the extension is loaded unpacked,
+  the popup gains a *Development* section showing where the dedup cache lives
+  (`chrome.storage.local`, keys `savedFiles` / `savedUrls`), live cached-file
+  and cached-URL counts, the resolved save location, and a scrollable list of
+  cached filenames with sizes (most recent first, capped at 200). The save
+  location has **Copy location** and **Open folder** buttons — open launches
+  the Downloads folder (Chrome offers no API to target the subfolder
+  directly; in custom-folder mode open is hidden since Chrome can't open
+  arbitrary folders). Hidden on normal installs. Requires the `management`
+  permission (for install-type detection) and `clipboardWrite`.
+
 ## What's new in 1.2.0
 
 - **Typed min size + optional max size:** the slider is now a type-in field
