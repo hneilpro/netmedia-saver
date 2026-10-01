@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <div class="title">NetMedia Saver</div>
+  <label class="switch">
+    <input type="checkbox" id="enabled">
+    <span class="slider"></span>
+  </label>
+</header>
+
+<section>
+  <div class="row label-row"><span>Minimum file size</span><span id="minVal" class="dim"></span></div>
+  <input type="range" id="minSize" min="0" max="5120" step="10" value="200">
+  <div class="chips">
+    <button data-kb="50">50 KB</button>
+    <button data-kb="200">200 KB</button>
+    <button data-kb="1024">1 MB</button>
+    <button data-kb="5120">5 MB</button>
+  </div>
+</section>
+
+<section>
+  <div class="row label-row"><span>Capture</span></div>
+  <div class="row checks">
+    <label><input type="checkbox" id="tImage"> Images</label>
+    <label><input type="checkbox" id="tVideo"> Video</label>
+    <label><input type="checkbox" id="tAudio"> Audio</label>
+  </div>
+  <label class="row"><input type="checkbox" id="saveUnknown"> <span>Save files with unknown size</span></label>
+</section>
+
+<section>
+  <div class="row label-row"><span>Save location</span></div>
+  <div class="row"><label><input type="radio" name="loc" id="locDl" checked> <span>Downloads subfolder</span></label></div>
+  <input type="text" id="subfolder" placeholder="netsaver/{date}" title="Tokens: {date} {host} {kind}">
+  <div class="hint dim">Tokens: {date} {host} {kind}</div>
+  <div class="row"><label><input type="radio" name="loc" id="locCustom"> <span>Custom folder</span></label></div>
+  <div class="row">
+    <button id="pickFolder">Choose folder…</button>
+    <span id="folderName" class="dim"></span>
+  </div>
+  <div class="hint dim">Custom folder needs a one-time pick; Chrome then writes there silently.</div>
+</section>
+
+<section>
+  <div class="row label-row"><span>This session</span>
+    <span><button id="resetStats" class="link">reset</button> · <button id="clearDedup" class="link">forget saved URLs</button></span>
+  </div>
+  <div class="row stats"><span id="statFiles">0 files</span><span id="statBytes" class="dim">0 B</span><span id="statQueue" class="dim"></span></div>
+</section>
+
+<section>
+  <div class="row label-row"><span>Recent</span><button id="clearLog" class="link">clear</button></div>
+  <ul id="log"></ul>
+</section>
+
+<footer class="dim">blob:/data: URLs and one-time signed links can't be captured — see README.</footer>
+<script src="popup.js"></script>
+</body>
+</html>
