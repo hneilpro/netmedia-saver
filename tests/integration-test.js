@@ -21,7 +21,61 @@ function ok(cond, name) {
 const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
 
 const DLDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nms-int-'));
-const SITEDIR = '/tmp/nms-live/site';
+
+// ---------- self-contained fixtures ----------
+// Generated at startup (pure Node, no deps) so the test never depends on an
+// external fixture directory. JPEGs are header-valid minimal files: SOI +
+// APP0 + SOF0(with real dimensions) + EOI, zero-padded to the target size.
+// The dimension probe only walks markers to SOF, and nothing decodes pixels,
+// so this is all the validity any scenario needs.
+const SITEDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nms-site-'));
+const zlib = require('zlib');
+const CRC_TBL = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i++) c = CRC_TBL[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+function pngChunk(type, data) {
+  const td = Buffer.from(type, 'ascii');
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(Buffer.concat([td, data])), 0);
+  return Buffer.concat([len, td, data, crc]);
+}
+function solidPng(w, h) { // black truecolor PNG; compresses tiny
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2; // 8-bit truecolor
+  const raw = Buffer.alloc((w * 3 + 1) * h); // filter byte 0 per row + zero pixels
+  const idat = zlib.deflateSync(raw);
+  return Buffer.concat([sig, pngChunk('IHDR', ihdr), pngChunk('IDAT', idat), pngChunk('IEND', Buffer.alloc(0))]);
+}
+function minimalJpeg(w, h, totalSize) {
+  const head = Buffer.from([
+    0xff, 0xd8,                                           // SOI
+    0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, // APP0 "JFIF\0"
+    0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0xff, 0xc0, 0x00, 0x11, 0x08,                         // SOF0, len 17, 8-bit
+    (h >> 8) & 0xff, h & 0xff, (w >> 8) & 0xff, w & 0xff,
+    0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, // 3 components
+    0xff, 0xd9,                                           // EOI
+  ]);
+  return Buffer.concat([head, Buffer.alloc(Math.max(0, totalSize - head.length))]);
+}
+fs.mkdirSync(path.join(SITEDIR, 'sig1'), { recursive: true });
+fs.writeFileSync(path.join(SITEDIR, 'race.jpg'), minimalJpeg(800, 600, 903894));
+fs.writeFileSync(path.join(SITEDIR, 'sig1/photo.jpg'), minimalJpeg(800, 600, 200000));
+fs.writeFileSync(path.join(SITEDIR, 'big-dims.png'), solidPng(800, 600));   // dims pass, size fails
+fs.writeFileSync(path.join(SITEDIR, 'small-dims.png'), solidPng(100, 100)); // both fail
 // distinct fixtures per scenario (copies made at startup)
 const FIX = {
   race: 'race.jpg',            // concurrent same-URL race

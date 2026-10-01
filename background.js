@@ -47,6 +47,9 @@ const DEFAULTS = {
   skipExisting: true,      // don't re-save files already in the folder
   skipScope: 'basename',   // 'basename' = same filename in any subfolder; 'exact' = exact folder + filename
   enabledTabId: -1,        // tab the extension was last enabled on; unknown tabs default off unless they are this one
+  captureScope: 'tab',     // 'tab' = capture on the enabled tab only; 'whitelist'/'blacklist' = by website
+  siteWhitelist: [],       // normalized hosts; capture only on these sites
+  siteBlacklist: [],       // normalized hosts; capture everywhere except these
 };
 
 const MIME_EXT = {
@@ -101,6 +104,14 @@ async function loadState() {
   if (s.tabStates && typeof s.tabStates === 'object') tabEnabled = { ...s.tabStates };
   if (s.stats) { sessionSaved = s.stats.savedCount || 0; sessionBytes = s.stats.savedBytes || 0; }
   updateBadge();
+
+  // Seed the tab-host map for website whitelist/blacklist matching.
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs || []) {
+      if (t && typeof t.id === 'number' && t.id >= 0) trackTab(t.id, t.url);
+    }
+  } catch (e) { /* tabs unavailable */ }
 
   // Best-effort prune of tab states for tabs that no longer exist.
   try {
@@ -196,7 +207,7 @@ function updateBadge() {
 
 async function updateTabTitle(tabId) {
   try {
-    const on = effectiveEnabled(tabId);
+    const on = await effectiveEnabled(tabId);
     await chrome.action.setTitle({
       tabId,
       title: `NetMedia Saver — ${on ? 'capturing on this tab' : 'paused on this tab'}`,
@@ -204,18 +215,77 @@ async function updateTabTitle(tabId) {
   } catch (e) { /* tab gone */ }
 }
 
-/* ---------- per-tab enable ---------- */
+/* ---------- capture scope: this tab / website whitelist / website blacklist ---------- */
 
-function effectiveEnabled(tabId) {
+const tabHosts = {}; // tabId -> page hostname, seeded at startup, kept fresh by tabs.onUpdated
+
+function hostnameOf(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+    return u.hostname.toLowerCase();
+  } catch (e) { return ''; }
+}
+
+// "HTTPS://Mail.Example.com:8080/a/b" -> "mail.example.com"; "" when unusable.
+function normalizeSitePattern(input) {
+  let s = String(input || '').trim().toLowerCase();
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, ''); // strip scheme
+  s = s.split(/[/?#]/)[0];                      // strip path/query/fragment
+  s = s.replace(/^\*\./, '').replace(/^\./, ''); // strip leading "*." / "."
+  s = s.replace(/:\d+$/, '');                   // strip port
+  s = s.replace(/\.$/, '');                      // strip trailing dot
+  // Must look like a hostname: labels of letters/digits/hyphens ("localhost" ok).
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(s)) return '';
+  return s;
+}
+
+// "a.example.com" matches pattern "example.com"; "notexample.com" does not.
+function hostMatches(host, pattern) {
+  if (!host || !pattern) return false;
+  return host === pattern || host.endsWith('.' + pattern);
+}
+
+function hostMatchesAny(host, list) {
+  return Array.isArray(list) && list.some((p) => hostMatches(host, p));
+}
+
+async function tabHostname(tabId) {
+  if (tabHosts[tabId]) return tabHosts[tabId];
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const h = hostnameOf(tab && tab.url);
+    if (h) tabHosts[tabId] = h;
+    return h;
+  } catch (e) { return ''; }
+}
+
+async function effectiveEnabled(tabId) {
   if (!settings.enabled) return false;
   if (tabId == null || tabId < 0) return true; // non-tab requests (e.g. workers) follow the global switch
-  if (tabId in tabEnabled) return tabEnabled[tabId];
+  if (tabId in tabEnabled) return tabEnabled[tabId]; // explicit per-tab choice always wins
+  const scope = settings.captureScope || 'tab';
+  // Website lists match the page's host, not the media file's host (CDNs differ per site).
+  if (scope === 'whitelist') return hostMatchesAny(await tabHostname(tabId), settings.siteWhitelist);
+  if (scope === 'blacklist') return !hostMatchesAny(await tabHostname(tabId), settings.siteBlacklist);
   if (settings.enabledTabId < 0) return true; // never explicitly enabled (e.g. upgraded v1.x settings) — legacy behavior
   // Default: only the tab the extension was enabled on captures.
   return tabId === settings.enabledTabId;
 }
 
+function trackTab(tabId, url) {
+  const h = hostnameOf(url);
+  if (h) tabHosts[tabId] = h; else delete tabHosts[tabId];
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = (tab && tab.url) || changeInfo.url;
+  if (url) trackTab(tabId, url);
+  updateTabTitle(tabId); // the host may have changed, so the allowed state may have changed
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
+  delete tabHosts[tabId];
   if (tabId in tabEnabled) {
     delete tabEnabled[tabId];
     persistTabStates();
@@ -755,7 +825,7 @@ chrome.downloads.onChanged.addListener((delta) => {
 
 async function onHeadersReceived(details) {
   const tabId = typeof details.tabId === 'number' ? details.tabId : -1;
-  if (!effectiveEnabled(tabId)) return; // silently ignore tabs that are disabled
+  if (!(await effectiveEnabled(tabId))) return; // silently ignore tabs that are disabled
   if (details.method !== 'GET') return;
   const url = details.url;
   if (!/^https?:\/\//i.test(url)) return; // skip blob:, data:, etc.
@@ -867,7 +937,7 @@ async function onMessage(msg, _sender, sendResponse) {
       cacheStats: { urls: savedUrls.size, files: savedFiles.size } };
     if (typeof msg.tabId === 'number') {
       out.tabId = msg.tabId;
-      out.tabEnabled = effectiveEnabled(msg.tabId);
+      out.tabEnabled = await effectiveEnabled(msg.tabId);
     }
     sendResponse(out);
   } else if (msg.cmd === 'setSettings') {
@@ -889,7 +959,26 @@ async function onMessage(msg, _sender, sendResponse) {
       persistTabStates();
       await updateTabTitle(tabId);
     }
-    sendResponse({ ok: true, tabEnabled: effectiveEnabled(tabId) });
+    sendResponse({ ok: true, tabEnabled: await effectiveEnabled(tabId) });
+  } else if (msg.cmd === 'addSite') {
+    const key = msg.list === 'siteBlacklist' ? 'siteBlacklist' : 'siteWhitelist';
+    const norm = normalizeSitePattern(msg.site);
+    let added = false;
+    if (norm) {
+      const list = settings[key] || (settings[key] = []);
+      if (!list.includes(norm)) { list.push(norm); added = true; }
+    }
+    if (added) await saveSettings();
+    sendResponse({ ok: added, settings, site: norm });
+  } else if (msg.cmd === 'removeSite') {
+    const key = msg.list === 'siteBlacklist' ? 'siteBlacklist' : 'siteWhitelist';
+    const norm = normalizeSitePattern(msg.site);
+    const list = settings[key] || [];
+    const i = list.indexOf(norm);
+    let removed = false;
+    if (i >= 0) { list.splice(i, 1); removed = true; }
+    if (removed) await saveSettings();
+    sendResponse({ ok: removed, settings });
   } else if (msg.cmd === 'cacheFiles') {
     // Chunked upload from the popup's recursive walk of the custom folder.
     let added = 0;
@@ -947,6 +1036,11 @@ if (typeof module !== 'undefined' && module.exports) {
     effectiveEnabled,
     isDuplicate,
     addSavedFile,
+    hostnameOf,
+    normalizeSitePattern,
+    hostMatches,
+    hostMatchesAny,
+    tabHostname,
     removeSavedFile,
     claimInFlight,
     inFlightMatch,

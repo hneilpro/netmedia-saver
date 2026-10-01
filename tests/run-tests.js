@@ -20,6 +20,7 @@ const eraseCalls = [];       // chrome.downloads.erase invocations
 let nextDlId = 101;
 let downloadSearchResults = [];
 const listeners = {};
+const mockTabUrls = {}; // tabId -> page URL, backing chrome.tabs.get in tests
 
 function storageGet(keys) {
   const out = {};
@@ -49,7 +50,9 @@ const chrome = {
   },
   tabs: {
     onRemoved: { addListener: (fn) => { listeners.tabRemoved = fn; } },
+    onUpdated: { addListener: (fn) => { listeners.tabUpdated = fn; } },
     query: async () => [],
+    get: async (id) => ({ id, url: mockTabUrls[id] || '' }),
   },
   action: {
     setBadgeText: () => {},
@@ -97,27 +100,27 @@ async function main() {
   ok(s0.maxSizeKB === 0, 'default maxSizeKB is 0 (no limit)');
   ok(s0.enabledTabId === -1, 'default enabledTabId is -1');
   ok(s0.enabled === false, 'default is off until the first explicit enable');
-  ok(nms.effectiveEnabled(7) === false, 'fresh install captures nothing until enabled');
+  ok((await nms.effectiveEnabled(7)) === false, 'fresh install captures nothing until enabled');
 
   // 2. Legacy upgrade path: enabled=true stored, no origin recorded -> old behavior
   await msg({ cmd: 'setSettings', settings: { enabled: true } }); // no tabId
   ok(nms.getSettings().enabledTabId === -1, 'no origin recorded without a tab id');
-  ok(nms.effectiveEnabled(7) === true && nms.effectiveEnabled(8) === true,
+  ok((await nms.effectiveEnabled(7)) === true && (await nms.effectiveEnabled(8)) === true,
     'upgraded installs keep capture-everywhere until re-enabled');
 
   // 3. Origin-tab default: enable on tab 7 -> only tab 7 captures
   await msg({ cmd: 'setSettings', settings: { enabled: true }, tabId: 7 });
   ok(nms.getSettings().enabledTabId === 7, 'enabling records the origin tab');
-  ok(nms.effectiveEnabled(7) === true, 'origin tab captures');
-  ok(nms.effectiveEnabled(8) === false, 'other tabs do NOT capture by default');
-  ok(nms.effectiveEnabled(-1) === true, 'non-tab requests follow the global switch');
+  ok((await nms.effectiveEnabled(7)) === true, 'origin tab captures');
+  ok((await nms.effectiveEnabled(8)) === false, 'other tabs do NOT capture by default');
+  ok((await nms.effectiveEnabled(-1)) === true, 'non-tab requests follow the global switch');
   await msg({ cmd: 'setTabEnabled', tabId: 8, enabled: true });
-  ok(nms.effectiveEnabled(8) === true, 'explicit per-tab opt-in still works');
+  ok((await nms.effectiveEnabled(8)) === true, 'explicit per-tab opt-in still works');
   await msg({ cmd: 'setSettings', settings: { enabled: false }, tabId: 7 });
-  ok(nms.effectiveEnabled(7) === false && nms.effectiveEnabled(8) === false, 'global off overrides every tab');
+  ok((await nms.effectiveEnabled(7)) === false && (await nms.effectiveEnabled(8)) === false, 'global off overrides every tab');
   await msg({ cmd: 'setSettings', settings: { enabled: true }, tabId: 9 });
   ok(nms.getSettings().enabledTabId === 9, 're-enabling moves the origin tab');
-  ok(nms.effectiveEnabled(9) === true && nms.effectiveEnabled(7) === false, 'new origin captures, old one does not');
+  ok((await nms.effectiveEnabled(9)) === true && (await nms.effectiveEnabled(7)) === false, 'new origin captures, old one does not');
 
   // 4. getState serves the popup without throwing and reports the effective tab state
   const gs = await msg({ cmd: 'getState', tabId: 9 });
@@ -150,6 +153,66 @@ async function main() {
     'basename dedup works in both directions across namespaces');
   ok(Array.isArray(nms.getSettings().extraFolderNames),
     'settings carry extraFolderNames (default empty)');
+
+  // 8. Capture scope: website whitelist / blacklist
+  ok(nms.normalizeSitePattern('HTTPS://Mail.Example.com:8080/a/b') === 'mail.example.com',
+    'site patterns normalize (scheme/port/path stripped, lowercased)');
+  ok(nms.normalizeSitePattern('*.example.com') === 'example.com', 'leading *. stripped');
+  ok(nms.normalizeSitePattern('  example.com. ') === 'example.com', 'whitespace + trailing dot stripped');
+  ok(nms.normalizeSitePattern('localhost') === 'localhost', 'single-label hosts allowed');
+  ok(nms.normalizeSitePattern('???') === '', 'garbage rejected');
+  ok(nms.normalizeSitePattern('not a site') === '', 'spaces rejected');
+  ok(nms.hostMatches('example.com', 'example.com') === true, 'exact host matches');
+  ok(nms.hostMatches('a.example.com', 'example.com') === true, 'subdomain matches');
+  ok(nms.hostMatches('notexample.com', 'example.com') === false, 'suffix trick does not match');
+  ok(nms.hostMatches('', 'example.com') === false, 'empty host never matches');
+
+  mockTabUrls[21] = 'https://x.com/home';
+  mockTabUrls[22] = 'https://sub.x.com/';
+  mockTabUrls[23] = 'https://other.org/';
+  mockTabUrls[24] = 'chrome://newtab/';
+  ok((nms.getSettings().captureScope || 'tab') === 'tab', 'default capture scope is this-tab');
+
+  await msg({ cmd: 'setSettings', settings: { enabled: true, captureScope: 'whitelist', siteWhitelist: ['x.com'] }, tabId: 21 });
+  ok((await nms.effectiveEnabled(21)) === true, 'whitelist: listed site captures');
+  ok((await nms.effectiveEnabled(22)) === true, 'whitelist: subdomain captures');
+  ok((await nms.effectiveEnabled(23)) === false, 'whitelist: unlisted site does not capture');
+  ok((await nms.effectiveEnabled(24)) === false, 'whitelist: hostless tab does not capture');
+
+  await msg({ cmd: 'setSettings', settings: { captureScope: 'blacklist', siteBlacklist: ['x.com'] } });
+  ok((await nms.effectiveEnabled(21)) === false, 'blacklist: listed site does not capture');
+  ok((await nms.effectiveEnabled(22)) === false, 'blacklist: subdomain of listed site does not capture');
+  ok((await nms.effectiveEnabled(23)) === true, 'blacklist: other sites capture');
+  ok((await nms.effectiveEnabled(24)) === true, 'blacklist: hostless tab captures');
+
+  // tabs.onUpdated keeps the host map fresh (no tabs.get fallback needed)
+  listeners.tabUpdated(25, {}, { id: 25, url: 'https://deep.sub.x.com/page' });
+  ok((await nms.effectiveEnabled(25)) === false, 'blacklist: host tracked via onUpdated is honored');
+
+  // Explicit per-tab choice wins over the lists
+  await msg({ cmd: 'setTabEnabled', tabId: 23, enabled: false });
+  ok((await nms.effectiveEnabled(23)) === false, 'explicit per-tab off wins over blacklist');
+  await msg({ cmd: 'setTabEnabled', tabId: 21, enabled: true });
+  ok((await nms.effectiveEnabled(21)) === true, 'explicit per-tab on wins over blacklist');
+
+  // addSite / removeSite
+  const a1 = await msg({ cmd: 'addSite', list: 'siteWhitelist', site: 'HTTPS://Instagram.com/' });
+  ok(a1.ok === true && a1.site === 'instagram.com', 'addSite normalizes and adds');
+  ok(nms.getSettings().siteWhitelist.includes('instagram.com'), 'addSite persists to settings');
+  const a2 = await msg({ cmd: 'addSite', list: 'siteWhitelist', site: 'instagram.com' });
+  ok(a2.ok === false, 'addSite refuses duplicates');
+  const a3 = await msg({ cmd: 'addSite', list: 'siteBlacklist', site: '???' });
+  ok(a3.ok === false, 'addSite refuses garbage');
+  const a4 = await msg({ cmd: 'removeSite', list: 'siteWhitelist', site: 'instagram.com' });
+  ok(a4.ok === true && !nms.getSettings().siteWhitelist.includes('instagram.com'), 'removeSite removes');
+  const a5 = await msg({ cmd: 'removeSite', list: 'siteWhitelist', site: 'instagram.com' });
+  ok(a5.ok === false, 'removeSite reports missing entries');
+
+  // Back to this-tab scope: previous behavior intact. Restore the fixture
+  // state the observer tests below expect (origin tab 9, enabled).
+  await msg({ cmd: 'setSettings', settings: { enabled: true, captureScope: 'tab' }, tabId: 9 });
+  ok((await nms.effectiveEnabled(9)) === true, 'tab scope restored: origin tab captures');
+  ok((await nms.effectiveEnabled(21)) === true, 'per-tab override still applies after switching back');
 
   // 3. Min gate (typed value): 150KB skipped, 250KB saved
   downloadCalls.length = 0;

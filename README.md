@@ -14,6 +14,25 @@ you scroll, with no clicks per file.
 
 No build step — it's plain HTML/JS.
 
+## v1.7.0 — where to capture: this tab, website whitelist, website blacklist
+
+The popup's **Where to capture** section offers three scopes (global switch stays
+the master on/off):
+
+- **This tab only** (default): only the tab the extension was enabled on
+  captures — opt other tabs in via *Capture on this tab*.
+- **Whitelist — only these sites**: capture on any tab whose page host matches
+  a listed domain (`x.com` also matches `sub.x.com`). Matching is by the page
+  you're on, not the CDN the file is hosted from.
+- **Blacklist — everywhere except these**: capture on every tab except listed
+  sites.
+
+Type a domain (or hit **Add this site** for the current tab); entries normalize
+(`HTTPS://Mail.Example.com:8080/a` → `mail.example.com`) and duplicates are
+refused. The per-tab *Capture on this tab* checkbox is an explicit override
+that wins over the lists in every mode. Requires the warning-free `tabs`
+permission so the service worker can see page hosts.
+
 ## How it works
 
 - `chrome.webRequest.onHeadersReceived` observes every image / media / XHR

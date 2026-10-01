@@ -29,6 +29,12 @@ button.link { border: none; padding: 0; color: #3b82f6; }
 #extraFolders li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-top: 1px solid #8882; font-size: 12px; }
 #extraFolders li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #extraFolders li button { padding: 1px 8px; }
+#siteList { list-style: none; margin: 4px 0; padding: 0; max-height: 110px; overflow-y: auto; }
+#siteList li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-top: 1px solid #8882; font-size: 12px; }
+#siteList li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#siteList li button { padding: 1px 8px; }
+.site-add-row { display: flex; gap: 6px; }
+.site-add-row input { flex: 1; min-width: 0; }
 footer { padding-top: 10px; font-size: 11px; }
 /* toggle switch */
 .switch { position: relative; width: 44px; height: 24px; }

@@ -42,6 +42,45 @@ async function removeExtraFolder(i) {
   refresh();
 }
 
+/* Website whitelist/blacklist editor. Normalization + dedup happen in the SW. */
+function renderSiteList(listKey) {
+  const ul = $('siteList');
+  ul.innerHTML = '';
+  for (const name of (settings[listKey] || [])) {
+    const li = document.createElement('li');
+    const nm = document.createElement('span');
+    nm.className = 'nm'; nm.textContent = name; nm.title = name;
+    const rm = document.createElement('button');
+    rm.textContent = 'Remove';
+    rm.addEventListener('click', async () => {
+      const r = await chrome.runtime.sendMessage({ cmd: 'removeSite', list: listKey, site: name });
+      settings = r.settings;
+      refresh();
+    });
+    li.append(nm, rm);
+    ul.appendChild(li);
+  }
+  if (!ul.children.length) ul.innerHTML = '<li class="dim">No sites yet.</li>';
+}
+
+function siteStatus(t) {
+  const s = $('siteStatus');
+  s.textContent = t;
+  clearTimeout(siteStatus._t);
+  siteStatus._t = setTimeout(() => { s.textContent = ''; }, 2500);
+}
+
+async function sendAddSite(raw) {
+  const scope = settings.captureScope || 'tab';
+  if (scope === 'tab') return;
+  const list = scope === 'whitelist' ? 'siteWhitelist' : 'siteBlacklist';
+  const r = await chrome.runtime.sendMessage({ cmd: 'addSite', list, site: raw });
+  settings = r.settings;
+  if (r.ok) { $('siteInput').value = ''; siteStatus(`Added ${r.site}.`); }
+  else siteStatus(r.site ? 'Already in the list.' : 'That doesn’t look like a website domain.');
+  refresh();
+}
+
 function fmtBytes(n) {
   if (!n) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB'];
@@ -52,9 +91,11 @@ function fmtBytes(n) {
 
 let settings = null;
 let activeTabId = -1;
+let currentHost = '';
 let devSaveLocText = '';
 let devListLoaded = false;
 let lastExtraNames = null;
+let lastSiteKey = null;
 
 function todayStr() {
   const d = new Date();
@@ -68,7 +109,10 @@ async function refresh() {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs && tabs[0] && typeof tabs[0].id === 'number') {
       activeTabId = tabs[0].id;
-      try { host = new URL(tabs[0].url || '').hostname; } catch (e) { /* ignore */ }
+      try {
+        const u = new URL(tabs[0].url || '');
+        host = (u.protocol === 'http:' || u.protocol === 'https:') ? u.hostname : '';
+      } catch (e) { /* ignore */ }
     }
   } catch (e) { /* tabs unavailable */ }
 
@@ -99,8 +143,22 @@ async function refresh() {
   $('skipExisting').checked = !!settings.skipExisting;
   $('skipScope').value = settings.skipScope || 'basename';
 
-  // This tab
-  $('tabHost').textContent = host;
+  // Where to capture: this tab / website whitelist / website blacklist
+  currentHost = host;
+  $('tabHost').textContent = host ? `this tab: ${host}` : '';
+  const scope = settings.captureScope || 'tab';
+  $('scopeTab').checked = scope === 'tab';
+  $('scopeWhite').checked = scope === 'whitelist';
+  $('scopeBlack').checked = scope === 'blacklist';
+  const listMode = scope !== 'tab';
+  $('siteListWrap').hidden = !listMode;
+  if (listMode) {
+    const listKey = scope === 'whitelist' ? 'siteWhitelist' : 'siteBlacklist';
+    const key = scope + ':' + JSON.stringify(settings[listKey] || []);
+    if (key !== lastSiteKey) { lastSiteKey = key; renderSiteList(listKey); }
+  } else {
+    lastSiteKey = null;
+  }
   const te = $('tabEnabled');
   te.checked = st.tabEnabled !== false;
   const globalOff = !settings.enabled;
@@ -109,7 +167,11 @@ async function refresh() {
     ? 'Global switch is off — capture is paused everywhere.'
     : (activeTabId < 0
         ? 'Could not identify the current tab.'
-        : 'Only the tab the extension was enabled on captures by default — tick the box to add this tab.');
+        : scope === 'whitelist'
+          ? 'Capturing on whitelisted sites. Tick the box to always capture on this tab too.'
+          : scope === 'blacklist'
+            ? 'Capturing everywhere except blacklisted sites. Untick the box to pause this tab.'
+            : 'Only the tab the extension was enabled on captures by default — tick the box to add this tab.');
 
   $('statFiles').textContent = `${st.sessionSaved} files`;
   $('statBytes').textContent = fmtBytes(st.sessionBytes);
@@ -269,6 +331,25 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   $('skipExisting').addEventListener('change', (e) => push({ skipExisting: e.target.checked }).then(refresh));
   $('skipScope').addEventListener('change', (e) => push({ skipScope: e.target.value }).then(refresh));
+  document.querySelectorAll('input[name="scope"]').forEach((r) =>
+    r.addEventListener('change', () => {
+      const id = document.querySelector('input[name="scope"]:checked').id;
+      push({ captureScope: id === 'scopeWhite' ? 'whitelist' : id === 'scopeBlack' ? 'blacklist' : 'tab' }).then(refresh);
+    }));
+  $('siteAdd').addEventListener('click', async () => {
+    const v = $('siteInput').value;
+    if (v.trim()) await sendAddSite(v);
+  });
+  $('siteInput').addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+      const v = $('siteInput').value;
+      if (v.trim()) await sendAddSite(v);
+    }
+  });
+  $('siteAddTab').addEventListener('click', async () => {
+    if (!currentHost) { siteStatus('No site detected on this tab.'); return; }
+    await sendAddSite(currentHost);
+  });
   $('tabEnabled').addEventListener('change', async (e) => {
     if (activeTabId >= 0) {
       await chrome.runtime.sendMessage({ cmd: 'setTabEnabled', tabId: activeTabId, enabled: e.target.checked });
