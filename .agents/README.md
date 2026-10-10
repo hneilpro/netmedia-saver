@@ -15,6 +15,8 @@ Repository-local instructions, coordination state, and evidence for AI agents wo
 │   └── critic/        # AGENTS.md + memory/MEMORY.md
 ├── workflows/         # 01-research, 02-plan-design, 03-build, 04-test, 05-critic-review, handoff
 ├── templates/         # task, handoff, research-note, test-report, critic-review, ADR, board-entry
+├── scripts/           # maintenance utilities (clean_board.py bounds BOARD.md; dry-run default)
+├── board-archive/     # BOARD-YYYY-MM.md monthly archives written by clean_board.py (created on first run)
 ├── tasks/             # one file per task (goal, non-goals, acceptance criteria, checks, result)
 ├── research/          # dated research notes with sources
 ├── decisions/         # ADRs (architecture/design decision records)

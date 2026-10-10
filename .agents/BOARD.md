@@ -11,6 +11,21 @@ The shared, durable board for every agent working in this repo. Read the latest 
 - This board is coordination, not a task tracker and not a chat log. Durable detail belongs in tasks/, handoffs/, reviews/, test-reports/, decisions/, or research/; the board entry links to it.
 - No secrets, no real personal data, no raw transcripts. Distilled findings only.
 
+## Cleanup
+
+The board stays bounded. When it passes either limit — newest 30 unpinned entries, or 32 KB — the builder runs the cleanup before posting a new entry:
+
+```text
+python3 .agents/scripts/clean_board.py          # dry-run: prints the plan, writes nothing
+python3 .agents/scripts/clean_board.py --apply  # archive overflow + rewrite board
+python3 .agents/scripts/clean_board.py --check  # exit 2 if over a limit (for hooks/CI)
+```
+
+- Overflow entries move verbatim to `.agents/board-archive/BOARD-YYYY-MM.md`, grouped by entry month. History is archived, never deleted.
+- Entries with `[PINNED]` (or `[KEEP]`) in the header line are always kept and count toward neither limit. Pin sparingly.
+- After an --apply run, post one board entry recording it: date, how many entries were archived, and the archive file names.
+- Automating this is allowed only as a --check alert. Never auto-apply from a hook or cron; a human-visible board entry records every archive.
+
 ## Entry format
 
 ```text

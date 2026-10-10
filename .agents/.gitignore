@@ -1,2 +1,6 @@
 scratch/*
 !scratch/.gitkeep
+
+# python bytecode from maintenance scripts
+__pycache__/
+*.pyc
