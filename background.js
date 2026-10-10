@@ -512,6 +512,52 @@ function fireCoalesced(base, rec) {
   enqueue(task);
 }
 
+/* ---------- Instagram original-tier URL derivation (v1.9) ---------- */
+
+// Instagram serves browsers a max 1440px-wide image via srcset, but the CDN
+// URL's `stp` param encodes the size tier (e.g. `dst-jpg_e35_s1080x1080_tt6`).
+// Stripping the `_s1080x1080` (or `_p1080x1080`) size suffix yields the
+// original-tier URL — the upload original with no size cap. This is the same
+// tier the yt-dlp extractor selects via pick_original().
+// Returns the derived URL, or null if the URL is not an Instagram image with
+// a strippable size tier.
+function deriveOriginalUrl(url) {
+  let u;
+  try { u = new URL(url); }
+  catch (e) { return null; }
+  const host = u.hostname.toLowerCase();
+  if (!host.includes('cdninstagram.com') && !host.includes('fbcdn.net')) return null;
+  const stp = u.searchParams.get('stp');
+  if (!stp) return null;
+  // Match _s1080x1080, _p1080x1350, etc. (s=square, p=portrait crop)
+  if (!/_[sp]\d+x\d+/.test(stp)) return null;
+  const origStp = stp.replace(/_[sp]\d+x\d+/g, '');
+  if (origStp === stp) return null;
+  u.searchParams.set('stp', origStp);
+  return u.toString();
+}
+
+// Verify a derived original-tier URL via HEAD: must return 200 with a
+// Content-Length larger than the captured variant. Returns the verified URL
+// or null. Timeout 8s; any failure means "keep the captured URL".
+async function verifyOriginalUrl(origUrl, capturedSize) {
+  if (typeof fetch !== 'function') return null;
+  try {
+    const res = await Promise.race([
+      fetch(origUrl, { method: 'HEAD', credentials: 'include' }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('verify-timeout')), 8000)),
+    ]);
+    if (!res.ok) return null;
+    const len = res.headers.get('content-length');
+    const origSize = len ? parseInt(len, 10) : null;
+    // Only upgrade if the original is actually larger (or size unknown on either side)
+    if (origSize !== null && capturedSize !== null && origSize <= capturedSize) return null;
+    return origUrl;
+  } catch (e) {
+    return null;
+  }
+}
+
 /* ---------- byte-range URL stripping (v1.8) ---------- */
 
 // Instagram video XHRs carry bytestart/byteend query params (206 partial
@@ -1001,22 +1047,45 @@ async function onHeadersReceived(details) {
   const claim = claimInFlight(url, relPath, sizeBytes);
   // ---- end of atomic prefix ----
 
-  if (!(await effectiveEnabled(tabId))) { claim.releaseAll(); return; } // silently ignore disabled tabs
+  // v1.9: Instagram original-tier upgrade. The browser fetches at most 1440w,
+  // but the CDN URL's stp param can be rewritten to the upload original.
+  // If the derived URL verifies (HEAD 200 + larger), swap to it now —
+  // release the old claim and claim the new URL so dedup stays correct.
+  // Size gates below use the captured sizeBytes (the original is larger,
+  // so a pass on the captured size implies a pass on the original).
+  let finalUrl = url;
+  let finalClaim = claim;
+  let finalRelPath = relPath;
+  if (kind === 'image') {
+    const origUrl = deriveOriginalUrl(url);
+    if (origUrl && !savedUrls.has(origUrl)) {
+      const verified = await verifyOriginalUrl(origUrl, sizeBytes);
+      if (verified) {
+        claim.releaseAll();
+        finalRelPath = buildRelPath(verified, kind, contentType);
+        finalClaim = claimInFlight(verified, finalRelPath, sizeBytes);
+        finalUrl = verified;
+        await addLog({ url: verified, kind, size: sizeBytes, status: 'upgraded-original', detail: 'derived original-tier URL' });
+      }
+    }
+  }
+
+  if (!(await effectiveEnabled(tabId))) { finalClaim.releaseAll(); return; } // silently ignore disabled tabs
 
   // v1.5: DASH/HLS fMP4 media segments look like ordinary video/mp4 responses
   // in the headers but are unplayable without the init segment — skip them
   // instead of filling the folder with "corrupted" files.
-  if ((kind === 'video' || kind === 'audio') && settings.skipSegments && isMediaSegment(url, contentType)) {
-    claim.releasePath(); // the URL stays claimed as the permanent dedup record; no download coming
-    await addLog({ url, kind, size: sizeBytes, status: 'skipped-segment' });
+  if ((kind === 'video' || kind === 'audio') && settings.skipSegments && isMediaSegment(finalUrl, contentType)) {
+    finalClaim.releasePath(); // the URL stays claimed as the permanent dedup record; no download coming
+    await addLog({ url: finalUrl, kind, size: sizeBytes, status: 'skipped-segment' });
     return;
   }
 
   // v1.8: same-basename history check. Same-basename bursts inside the
   // coalesce window are handled by coalesceEnqueue at enqueue time.
-  if (settings.skipExisting && isDuplicate(relPath, sizeBytes)) {
-    claim.releaseAll();
-    await addLog({ url, kind, size: sizeBytes, status: 'skipped-duplicate' });
+  if (settings.skipExisting && isDuplicate(finalRelPath, sizeBytes)) {
+    finalClaim.releaseAll();
+    await addLog({ url: finalUrl, kind, size: sizeBytes, status: 'skipped-duplicate' });
     return;
   }
 
@@ -1029,50 +1098,51 @@ async function onHeadersReceived(details) {
     // Videos, audio, or the dimension filter switched off: the size gate alone
     // decides, exactly as before.
     if (gate !== 'pass') {
-      claim.releaseAll();
-      await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
+      finalClaim.releaseAll();
+      await addLog({ url: finalUrl, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
       return;
     }
-    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: null });
+    await coalesceEnqueue({ url: finalUrl, kind, contentType, sizeBytes, relPath: finalRelPath, claim: finalClaim, dims: null });
     return;
   }
 
   if (logic === 'and') {
     // Default: BOTH the file-size gate and the dimension gate must pass.
     if (gate !== 'pass') {
-      claim.releaseAll();
-      await addLog({ url, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
+      finalClaim.releaseAll();
+      await addLog({ url: finalUrl, kind, size: sizeBytes, status: sizeSkipStatus(gate) });
       return;
     }
     // v1.5: optional image dimension gates — one tiny Range request per image.
     // Unknown dimensions never block the save.
-    const dims = await probeImageDimensions(url);
+    // v1.9: probe the FINAL (possibly upgraded) URL for accurate dimensions.
+    const dims = await probeImageDimensions(finalUrl);
     if (dims && !dimsPass(dims, imgCfg)) {
-      claim.releaseAll();
-      await addLog({ url, kind, size: sizeBytes, status: 'skipped-dims', detail: `${dims.w}×${dims.h}px` });
+      finalClaim.releaseAll();
+      await addLog({ url: finalUrl, kind, size: sizeBytes, status: 'skipped-dims', detail: `${dims.w}×${dims.h}px` });
       return;
     }
-    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: dims || null });
+    await coalesceEnqueue({ url: finalUrl, kind, contentType, sizeBytes, relPath: finalRelPath, claim: finalClaim, dims: dims || null });
     return;
   }
 
   // logic === 'or': save when the size gate OR the dimension gate passes.
   if (gate === 'pass') {
-    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims: null });
+    await coalesceEnqueue({ url: finalUrl, kind, contentType, sizeBytes, relPath: finalRelPath, claim: finalClaim, dims: null });
     return;
   }
-  const dims = await probeImageDimensions(url);
+  const dims = await probeImageDimensions(finalUrl);
   if (dims && dimsPass(dims, imgCfg)) {
-    await coalesceEnqueue({ url, kind, contentType, sizeBytes, relPath, claim, dims });
+    await coalesceEnqueue({ url: finalUrl, kind, contentType, sizeBytes, relPath: finalRelPath, claim: finalClaim, dims });
     return;
   }
   // Neither gate passed. Unknown dimensions can't satisfy the OR side, so they
   // count as a fail here (the size side already failed).
-  claim.releaseAll();
+  finalClaim.releaseAll();
   const maxTxt = settings.maxSizeKB > 0 ? `..${settings.maxSizeKB}KB` : '';
   const sizePart = sizeBytes === null ? 'size unknown' : `${Math.round(sizeBytes / 1024)}KB not in ${settings.minSizeKB}KB${maxTxt}`;
   const dimsPart = dims ? `${dims.w}×${dims.h}px out of range` : 'dims unknown';
-  await addLog({ url, kind, size: sizeBytes, status: 'skipped-filters', detail: `${sizePart}; ${dimsPart}` });
+  await addLog({ url: finalUrl, kind, size: sizeBytes, status: 'skipped-filters', detail: `${sizePart}; ${dimsPart}` });
 }
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -1214,5 +1284,7 @@ if (typeof module !== 'undefined' && module.exports) {
     stripRangeParams,
     betterCandidate,
     coalesceEnqueue,
+    deriveOriginalUrl,
+    verifyOriginalUrl,
   };
 }

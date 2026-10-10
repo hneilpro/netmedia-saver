@@ -659,6 +659,48 @@ async function main() {
   ok(downloadCalls[1].url === qLargeUrl, 'larger variant replaced the queued smaller task');
   await msg({ cmd: 'setSettings', settings: { maxConcurrent: 5 } });
 
+  // 28. v1.9: deriveOriginalUrl unit tests
+  const dou = nms.deriveOriginalUrl;
+  ok(dou('https://scontent-iad6-1.cdninstagram.com/v/t51.82787-15/123_n.jpg?stp=dst-jpg_e35_s1080x1080_tt6&oh=abc') ===
+     'https://scontent-iad6-1.cdninstagram.com/v/t51.82787-15/123_n.jpg?stp=dst-jpg_e35_tt6&oh=abc',
+    's1080x1080 size suffix stripped from stp');
+  ok(dou('https://scontent-iad3-2.cdninstagram.com/v/t51.82787-15/456_n.jpg?stp=dst-jpg_e35_p1080x1350_tt6') ===
+     'https://scontent-iad3-2.cdninstagram.com/v/t51.82787-15/456_n.jpg?stp=dst-jpg_e35_tt6',
+    'p1080x1350 portrait size suffix stripped');
+  ok(dou('https://scontent-iad6-1.cdninstagram.com/v/t51.82787-15/123_n.jpg?stp=dst-jpg_e35_tt6&oh=abc') === null,
+    'URL already at original tier (no size suffix) returns null');
+  ok(dou('https://example.com/photo.jpg?stp=dst-jpg_e35_s1080x1080_tt6') === null,
+    'non-Instagram CDN returns null');
+  ok(dou('https://scontent-iad6-1.cdninstagram.com/v/t51.82787-15/123_n.jpg?oh=abc') === null,
+    'URL without stp param returns null');
+  ok(dou('not a url') === null, 'unparseable URL returns null');
+
+  // 29. v1.9: verifyOriginalUrl — HEAD check with size comparison
+  // Mock fetch in the sandbox (background.js runs in a vm context)
+  const origSandboxFetch = sandbox.fetch;
+  sandbox.fetch = async (url, opts) => {
+    if (url.includes('verify-ok')) {
+      return { ok: true, headers: { get: (n) => n === 'content-length' ? '500000' : null } };
+    }
+    if (url.includes('verify-smaller')) {
+      return { ok: true, headers: { get: (n) => n === 'content-length' ? '50000' : null } };
+    }
+    if (url.includes('verify-404')) {
+      return { ok: false, headers: { get: () => null } };
+    }
+    throw new Error('network-error');
+  };
+  const vou = nms.verifyOriginalUrl;
+  ok(await vou('https://cdn.test/verify-ok.jpg', 100000) === 'https://cdn.test/verify-ok.jpg',
+    'larger original URL verifies and is returned');
+  ok(await vou('https://cdn.test/verify-smaller.jpg', 100000) === null,
+    'smaller original URL is rejected (not an upgrade)');
+  ok(await vou('https://cdn.test/verify-404.jpg', 100000) === null,
+    '404 original URL is rejected');
+  ok(await vou('https://cdn.test/verify-error.jpg', 100000) === null,
+    'network error during verification returns null (fail safe)');
+  sandbox.fetch = origSandboxFetch;
+
   console.log(`\n${pass} passed, ${fail} failed`);
   if (failures.length) { console.log('failures:', failures.join('; ')); process.exit(1); }
 }

@@ -16,6 +16,16 @@ Works in **Microsoft Edge** too (Chromium) — same steps via `edge://extensions
 
 No build step — it's plain HTML/JS.
 
+## v1.9.0 — Instagram original-tier upgrade
+
+- **Original-tier URL derivation:** Instagram serves browsers at most a 1440px-wide
+  image via srcset, but the CDN URL's `stp` query param encodes the size tier
+  (e.g. `dst-jpg_e35_s1080x1080_tt6`). The extension now strips the `_s1080x1080`
+  (or `_p1080x1350`) size suffix to derive the upload-original URL, verifies it
+  with a HEAD request (must return 200 with a larger Content-Length), and saves
+  the original instead of the display version. Falls back to the captured URL if
+  derivation fails or the original isn't larger. Logged as `upgraded-original`.
+
 ## v1.8.0 — duplicate + partial-file fixes (Instagram)
 
 - **True atomic dedup claims:** the URL check + claim now run in the
@@ -204,9 +214,11 @@ permission so the service worker can see page hosts.
 
 - The extension can only save what the browser actually **requests**.
   Instagram's `srcset` means the full-resolution variant is often never
-  fetched — only the displayed resolution hits the network — so don't expect
-  originals. If an image never appears in the log at all, the browser simply
-  never requested it (cached render, or a resolution below your filters).
+  fetched — only the displayed resolution hits the network. v1.9+ mitigates
+  this for Instagram images by deriving the original-tier URL from the `stp`
+  param and verifying it with a HEAD request before saving. If an image never
+  appears in the log at all, the browser simply never requested it (cached
+  render, or a resolution below your filters).
 - Video delivered as `blob:` URLs or MSE streams can't be re-fetched by
   design (webRequest can't read bodies); those never save, whatever the
   settings.
